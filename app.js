@@ -18,6 +18,7 @@
   const MAX_CAROUSEL_SLIDES = 7;
   const HERO_PROXIMITY_RADIUS_PX = 165;
   const MAX_CONCURRENT_HYDRATIONS = 6;
+  const SESSION_GAP_MS = 12 * 60 * 60 * 1000;
 
   const state = {
     manifest: null,
@@ -581,6 +582,7 @@
     const filtered = getFilteredPhotos();
     const firstIdx = filtered.findIndex((p) => p.date === dateKey);
     if (firstIdx === -1) return;
+    const targetPhoto = filtered[firstIdx];
 
     let minNeeded = Math.min(filtered.length, firstIdx + PAGE_BATCH_SIZE);
     if (filtered.length - minNeeded <= PAGE_BATCH_SIZE) {
@@ -599,12 +601,13 @@
 
     requestAnimationFrame(() => {
       const navH = syncNavHeight();
-      const section = document.getElementById(`chapter-${dateKey}`);
-      if (!section) return;
+      const entry = cardCache.get(targetPhoto.id);
+      const targetEl = entry && entry.figure;
+      if (!targetEl || !targetEl.isConnected) return;
 
       const targetTop = Math.max(
         0,
-        window.scrollY + section.getBoundingClientRect().top - navH - 12
+        window.scrollY + targetEl.getBoundingClientRect().top - navH - 12
       );
       const dist = Math.abs(targetTop - window.scrollY);
 
@@ -619,7 +622,7 @@
           const settledNavH = syncNavHeight();
           const finalTop = Math.max(
             0,
-            window.scrollY + section.getBoundingClientRect().top - settledNavH - 12
+            window.scrollY + targetEl.getBoundingClientRect().top - settledNavH - 12
           );
           window.scrollTo({ top: finalTop, behavior: "smooth" });
           scheduleHydrationAfterJump(420);
@@ -635,18 +638,22 @@
     if (performance.now() < suppressScrollObserversUntil) return;
     if (dom.dateChaptersNav.hidden) return;
 
-    const sections = dom.chaptersContainer.querySelectorAll(".date-chapter");
-    if (!sections.length) return;
+    const filtered = getFilteredPhotos();
+    const limit = Math.min(state.visibleCount, filtered.length);
+    if (limit === 0) return;
 
     const navH = dom.galleryNav ? dom.galleryNav.getBoundingClientRect().height : 58;
     const thresholdY = navH + 56;
 
-    let candidate = sections[0].dataset.date;
-    for (const sec of sections) {
-      const top = sec.getBoundingClientRect().top;
+    let candidate = filtered[0].date;
+    for (let i = 0; i < limit; i++) {
+      const p = filtered[i];
+      const entry = cardCache.get(p.id);
+      if (!entry || !entry.figure.isConnected) continue;
+      const top = entry.figure.getBoundingClientRect().top;
       if (top <= thresholdY) {
-        candidate = sec.dataset.date;
-      } else {
+        candidate = p.date;
+      } else if (top > thresholdY + 820) {
         break;
       }
     }
@@ -1069,7 +1076,56 @@
   // 5. Incremental Non-Destructive Gallery Rendering
   // =========================================================================
 
+  function parsePhotoTimestampMs(photo) {
+    if (!photo || typeof photo.timestamp !== "string") return NaN;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(
+      photo.timestamp.trim()
+    );
+    if (m) {
+      return Date.UTC(
+        Number(m[1]),
+        Number(m[2]) - 1,
+        Number(m[3]),
+        Number(m[4]),
+        Number(m[5]),
+        Number(m[6])
+      );
+    }
+    return Date.parse(photo.timestamp);
+  }
+
+  function groupPhotosIntoSessions(photos) {
+    const sessions = [];
+    for (let i = 0; i < photos.length; i++) {
+      const photo = photos[i];
+      if (i === 0) {
+        sessions.push([photo]);
+        continue;
+      }
+      const tPrev = parsePhotoTimestampMs(photos[i - 1]);
+      const tCurr = parsePhotoTimestampMs(photo);
+      const isNewSession =
+        Number.isFinite(tPrev) &&
+        Number.isFinite(tCurr) &&
+        Math.abs(tPrev - tCurr) > SESSION_GAP_MS;
+      if (isNewSession) {
+        sessions.push([photo]);
+      } else {
+        sessions[sessions.length - 1].push(photo);
+      }
+    }
+    return sessions;
+  }
+
   function buildSingleBlockDOM(block) {
+    if (block.type === "divider") {
+      const divEl = document.createElement("div");
+      divEl.className = "session-divider";
+      divEl.dataset.blockKey = block.key;
+      divEl.setAttribute("role", "separator");
+      return divEl;
+    }
+
     if (block.type === "spread") {
       const spreadEl = document.createElement("div");
       spreadEl.className = "editorial-spread";
@@ -1168,94 +1224,33 @@
     const gutter = 12;
 
     const visibleSlice = filtered.slice(0, state.visibleCount);
-    const totalDistinctDates = new Set(filtered.map((p) => p.date)).size;
 
-    if (totalDistinctDates <= 1) {
-      if (dom.chaptersContainer.dataset.mode !== "single") {
-        dom.chaptersContainer.replaceChildren();
-        dom.chaptersContainer.dataset.mode = "single";
-        const rowsWrap = document.createElement("div");
-        rowsWrap.className = "chapter-rows";
-        dom.chaptersContainer.appendChild(rowsWrap);
-      }
-      const rowsWrap = dom.chaptersContainer.firstElementChild;
-      const blocks = solveAutoLayout(visibleSlice, containerWidth, gutter);
-      reconcileBlocksContainer(rowsWrap, blocks);
-    } else {
-      if (dom.chaptersContainer.dataset.mode !== "chapters") {
-        dom.chaptersContainer.replaceChildren();
-        dom.chaptersContainer.dataset.mode = "chapters";
-      }
-
-      const existingByDate = new Map();
-      for (const child of Array.from(dom.chaptersContainer.children)) {
-        if (child.dataset.date) {
-          existingByDate.set(child.dataset.date, child);
-        }
-      }
-
-      const totalByDate = new Map();
-      for (const p of filtered) {
-        totalByDate.set(p.date, (totalByDate.get(p.date) || 0) + 1);
-      }
-
-      const activeSections = [];
-      for (const ch of state.chapters) {
-        const chPhotos = visibleSlice.filter((p) => p.date === ch.date);
-        if (chPhotos.length === 0) continue;
-
-        let section = existingByDate.get(ch.date);
-        let rowsWrap = null;
-        let countSpan = null;
-
-        if (!section) {
-          section = document.createElement("section");
-          section.className = "date-chapter";
-          section.id = `chapter-${ch.date}`;
-          section.dataset.date = ch.date;
-
-          const header = document.createElement("div");
-          header.className = "chapter-header";
-
-          const dateSpan = document.createElement("span");
-          dateSpan.className = "chapter-date-tag";
-          dateSpan.textContent = ch.fullDate || ch.date;
-
-          countSpan = document.createElement("span");
-          countSpan.className = "chapter-count-tag";
-
-          header.append(dateSpan, countSpan);
-
-          rowsWrap = document.createElement("div");
-          rowsWrap.className = "chapter-rows";
-
-          section.append(header, rowsWrap);
-        } else {
-          existingByDate.delete(ch.date);
-          countSpan = section.querySelector(".chapter-count-tag");
-          rowsWrap = section.querySelector(".chapter-rows");
-        }
-
-        if (countSpan) {
-          countSpan.textContent = `${totalByDate.get(ch.date) || chPhotos.length}`;
-        }
-
-        const blocks = solveAutoLayout(chPhotos, containerWidth, gutter);
-        reconcileBlocksContainer(rowsWrap, blocks);
-        activeSections.push(section);
-      }
-
-      for (const staleSection of existingByDate.values()) {
-        staleSection.remove();
-      }
-
-      for (let i = 0; i < activeSections.length; i++) {
-        const sec = activeSections[i];
-        if (dom.chaptersContainer.children[i] !== sec) {
-          dom.chaptersContainer.insertBefore(sec, dom.chaptersContainer.children[i] || null);
-        }
-      }
+    if (dom.chaptersContainer.dataset.mode !== "reel") {
+      dom.chaptersContainer.replaceChildren();
+      dom.chaptersContainer.dataset.mode = "reel";
+      const rowsWrap = document.createElement("div");
+      rowsWrap.className = "chapter-rows";
+      dom.chaptersContainer.appendChild(rowsWrap);
     }
+
+    const rowsWrap = dom.chaptersContainer.firstElementChild;
+    const sessions = groupPhotosIntoSessions(visibleSlice);
+    const blocks = [];
+
+    for (let sIdx = 0; sIdx < sessions.length; sIdx++) {
+      if (sIdx > 0) {
+        const prevSession = sessions[sIdx - 1];
+        const prevPhoto = prevSession[prevSession.length - 1];
+        const nextPhoto = sessions[sIdx][0];
+        blocks.push({
+          type: "divider",
+          key: `div:${prevPhoto.id}:${nextPhoto.id}`,
+        });
+      }
+      blocks.push(...solveAutoLayout(sessions[sIdx], containerWidth, gutter));
+    }
+
+    reconcileBlocksContainer(rowsWrap, blocks);
 
     dom.btnLoadMore.hidden = visibleSlice.length >= filtered.length;
     schedulePumpHydration();
