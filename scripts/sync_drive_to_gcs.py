@@ -32,7 +32,9 @@ from typing import Any
 from build_manifest import (
     finalize_manifest_from_records,
     inspect_image_bytes,
+    inspect_image_with_thumb,
     load_photo_sidecar_metadata,
+    make_grid_thumb_webp,
     resolve_stem_sidecar_metadata,
 )
 
@@ -345,6 +347,21 @@ def parse_args() -> argparse.Namespace:
         help=f"Google Drive folder ID when --local-dir is omitted (default: {DEFAULT_DRIVE_FOLDER_ID})",
     )
     parser.add_argument("--prefix", default="3k_exports", help="Object prefix inside GCS bucket")
+    parser.add_argument(
+        "--thumb-prefix",
+        default="thumbs",
+        help="GCS object prefix for 800px WebP grid thumbnails (default: thumbs)",
+    )
+    parser.add_argument(
+        "--no-thumbs",
+        action="store_true",
+        help="Disable generating and uploading 800px WebP grid thumbnails",
+    )
+    parser.add_argument(
+        "--backfill-thumbs",
+        action="store_true",
+        help="With --manifest-only, generate and upload any missing 800px WebP thumbnails from --local-dir or existing GCS 3K masters",
+    )
     parser.add_argument("--workers", type=int, default=12, help="Parallel transfer workers")
     parser.add_argument(
         "--manifest-out",
@@ -372,7 +389,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manifest-only",
         action="store_true",
-        help="Update timestamps, star ratings, and XMP focal points in manifest.json and upload manifest.json to GCS without re-uploading images",
+        help="Update timestamps, star ratings, and XMP focal points in manifest.json and upload manifest.json to GCS without re-uploading 3K masters",
     )
     parser.add_argument(
         "--force-upload",
@@ -388,12 +405,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _md5_b64(data: bytes) -> str:
+    return base64.b64encode(hashlib.md5(data).digest()).decode("ascii")
+
+
 def main() -> None:
     global QUOTA_PROJECT
     args = parse_args()
     QUOTA_PROJECT = detect_gcloud_project(args.project)
     bucket = args.bucket.replace("gs://", "").strip("/")
     prefix = args.prefix.strip("/")
+    thumb_prefix = args.thumb_prefix.strip("/")
+    enable_thumbs = (not args.no_thumbs) and bool(thumb_prefix)
     token = get_access_token(args.access_token)
     excluded_stems = {Path(s.strip()).stem for s in args.exclude.split(",") if s.strip()}
     explicit_cli_heroes = {Path(s.strip()).stem for s in args.heroes.split(",") if s.strip()}
@@ -411,6 +434,9 @@ def main() -> None:
         f"https://storage.googleapis.com/{bucket}/{prefix}"
         if prefix
         else f"https://storage.googleapis.com/{bucket}"
+    )
+    computed_thumb_base_url = (
+        f"https://storage.googleapis.com/{bucket}/{thumb_prefix}" if enable_thumbs else ""
     )
     remote_manifest_url = f"https://storage.googleapis.com/{bucket}/manifest.json"
 
@@ -434,6 +460,8 @@ def main() -> None:
         for fn in removed_filenames:
             obj_name = f"{prefix}/{fn}" if prefix else fn
             delete_gcs_object(bucket, obj_name, token)
+            if thumb_prefix:
+                delete_gcs_object(bucket, f"{thumb_prefix}/{Path(fn).stem}.webp", token)
         if removed_filenames:
             print(
                 f"      Removed {len(removed_filenames)} excluded object(s) from gs://{bucket}/: {', '.join(removed_filenames)}"
@@ -453,9 +481,75 @@ def main() -> None:
                 rec["focalPoint"] = meta["focalPoint"]
             updated_records.append(rec)
 
+        manifest_thumb_base_url = str(existing_coll.get("thumbBaseUrl") or "")
+        if args.backfill_thumbs and enable_thumbs:
+            manifest_thumb_base_url = computed_thumb_base_url
+            existing_map = list_gcs_object_map(bucket, token)
+            local_by_name: dict[str, Path] = {}
+            if args.local_dir is not None and args.local_dir.exists():
+                local_by_name = {p.name: p for p in list_local_images(args.local_dir)}
+
+            encoded_b = urllib.parse.quote(bucket, safe="")
+            to_backfill: list[dict[str, Any]] = []
+            already_present = 0
+            for rec in updated_records:
+                fn = rec.get("filename") or f"{rec['id']}.jpg"
+                stem = Path(fn).stem
+                thumb_rel = f"{stem}.webp"
+                thumb_obj = f"{thumb_prefix}/{thumb_rel}"
+                rec["thumb"] = thumb_rel
+                if (not args.force_upload) and (thumb_obj in existing_map):
+                    already_present += 1
+                else:
+                    to_backfill.append(rec)
+
+            if to_backfill:
+                print(
+                    f"      Backfilling {len(to_backfill)} 800px WebP thumbnail(s) -> gs://{bucket}/{thumb_prefix}/ "
+                    f"({already_present} already in GCS)..."
+                )
+
+                def _backfill_one(rec: dict[str, Any]) -> None:
+                    fn = rec.get("filename") or f"{rec['id']}.jpg"
+                    stem = Path(fn).stem
+                    if fn in local_by_name:
+                        raw_bytes = local_by_name[fn].read_bytes()
+                    else:
+                        src_obj = f"{prefix}/{fn}" if prefix else fn
+                        dl_url = (
+                            f"https://storage.googleapis.com/storage/v1/b/{encoded_b}/o/"
+                            f"{urllib.parse.quote(src_obj, safe='')}?alt=media"
+                        )
+                        raw_bytes = api_bytes(dl_url, token)
+                    thumb_bytes = make_grid_thumb_webp(raw_bytes)
+                    upload_gcs_object(
+                        bucket,
+                        f"{thumb_prefix}/{stem}.webp",
+                        thumb_bytes,
+                        "image/webp",
+                        "public, max-age=31536000, immutable",
+                        token,
+                    )
+
+                bf_done = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+                    futs = [pool.submit(_backfill_one, r) for r in to_backfill]
+                    for fut in concurrent.futures.as_completed(futs):
+                        fut.result()
+                        bf_done += 1
+                        if bf_done % 50 == 0 or bf_done == len(to_backfill):
+                            print(
+                                f"      Backfilled {bf_done}/{len(to_backfill)} thumbnails..."
+                            )
+            else:
+                print(
+                    f"      All {already_present} 800px WebP thumbnails already present in gs://{bucket}/{thumb_prefix}/."
+                )
+
         manifest = finalize_manifest_from_records(
             updated_records,
             base_url=existing_coll.get("assetBaseUrl") or base_url,
+            thumb_base_url=manifest_thumb_base_url,
             remote_manifest_url=existing_coll.get("remoteManifestUrl") or remote_manifest_url,
             title=existing_coll.get("title") or "",
             subtitle=existing_coll.get("subtitle") or "",
@@ -516,16 +610,26 @@ def main() -> None:
         source_filenames = {str(f["name"]) for f in drive_files}
         print(f"      Found {len(drive_files)} images in Drive.")
 
-    desired_obj_names = {
+    source_stems = {Path(fn).stem for fn in source_filenames}
+    desired_master_names = {
         (f"{prefix}/{fn}" if prefix else fn) for fn in source_filenames
     }
+    desired_thumb_names = (
+        {f"{thumb_prefix}/{stem}.webp" for stem in source_stems} if enable_thumbs else set()
+    )
+    desired_obj_names = desired_master_names | desired_thumb_names
 
     print(f"[2/5] Checking existing objects in gs://{bucket}/ ...")
     existing_map = list_gcs_object_map(bucket, token)
     to_delete = [
         name
         for name in existing_map
-        if (name.startswith(f"{prefix}/") or name.lower().endswith(IMAGE_EXTENSIONS))
+        if (not (args.no_thumbs and thumb_prefix and name.startswith(f"{thumb_prefix}/")))
+        and (
+            (prefix and name.startswith(f"{prefix}/"))
+            or (enable_thumbs and name.startswith(f"{thumb_prefix}/"))
+            or name.lower().endswith(IMAGE_EXTENSIONS)
+        )
         and (args.force_upload or name not in desired_obj_names)
     ]
     if to_delete:
@@ -545,12 +649,14 @@ def main() -> None:
 
     total_items = len(local_files) if args.local_dir is not None else len(drive_files)
     src_label = f"local {args.local_dir}" if args.local_dir is not None else "Drive"
-    print(f"[4/5] Syncing {total_items} {src_label} images -> gs://{bucket}/{prefix}/ ...")
+    thumb_note = f" + {thumb_prefix}/*.webp" if enable_thumbs else ""
+    print(
+        f"[4/5] Syncing {total_items} {src_label} images -> gs://{bucket}/{prefix}/{thumb_note} ..."
+    )
 
     def _upload_if_changed(obj_name: str, img_bytes: bytes, mime: str) -> bool:
         if not args.force_upload:
-            md5_b64 = base64.b64encode(hashlib.md5(img_bytes).digest()).decode("ascii")
-            if existing_map.get(obj_name) == (len(img_bytes), md5_b64):
+            if existing_map.get(obj_name) == (len(img_bytes), _md5_b64(img_bytes)):
                 return False
         upload_gcs_object(
             bucket,
@@ -562,24 +668,76 @@ def main() -> None:
         )
         return True
 
-    def transfer_local_one(path: Path) -> tuple[dict[str, Any], bool]:
+    def _process_and_sync_bytes(
+        img_bytes: bytes,
+        filename: str,
+        fallback_iso: str,
+        mime: str,
+    ) -> tuple[dict[str, Any], bool, bool]:
+        stem = Path(filename).stem
+        meta = resolve_stem_sidecar_metadata(stem, sidecar_meta_map)
+        obj_name = f"{prefix}/{filename}" if prefix else filename
+        master_unchanged = (not args.force_upload) and (
+            existing_map.get(obj_name) == (len(img_bytes), _md5_b64(img_bytes))
+        )
+
+        thumb_uploaded = False
+        if enable_thumbs:
+            thumb_obj_name = f"{thumb_prefix}/{stem}.webp"
+            thumb_already_ok = master_unchanged and (thumb_obj_name in existing_map)
+            if thumb_already_ok:
+                record = inspect_image_bytes(
+                    img_bytes,
+                    filename,
+                    fallback_iso,
+                    meta.get("timestamp"),
+                    meta,
+                )
+                record["thumb"] = f"{stem}.webp"
+            else:
+                record, thumb_bytes = inspect_image_with_thumb(
+                    img_bytes,
+                    filename,
+                    fallback_iso,
+                    meta.get("timestamp"),
+                    meta,
+                )
+                thumb_uploaded = _upload_if_changed(
+                    thumb_obj_name, thumb_bytes, "image/webp"
+                )
+        else:
+            record = inspect_image_bytes(
+                img_bytes,
+                filename,
+                fallback_iso,
+                meta.get("timestamp"),
+                meta,
+            )
+
+        master_uploaded = False
+        if not master_unchanged:
+            upload_gcs_object(
+                bucket,
+                obj_name,
+                img_bytes,
+                mime,
+                "public, max-age=31536000, immutable",
+                token,
+            )
+            master_uploaded = True
+
+        return record, master_uploaded, thumb_uploaded
+
+    def transfer_local_one(path: Path) -> tuple[dict[str, Any], bool, bool]:
         filename = path.name
         img_bytes = path.read_bytes()
         mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
         fallback_iso = mtime.strftime("%Y-%m-%dT%H:%M:%S")
-        meta = resolve_stem_sidecar_metadata(path.stem, sidecar_meta_map)
-        record = inspect_image_bytes(
-            img_bytes,
-            filename,
-            fallback_iso,
-            meta.get("timestamp"),
-            meta,
+        return _process_and_sync_bytes(
+            img_bytes, filename, fallback_iso, guess_image_mime(filename)
         )
-        obj_name = f"{prefix}/{filename}" if prefix else filename
-        uploaded = _upload_if_changed(obj_name, img_bytes, guess_image_mime(filename))
-        return record, uploaded
 
-    def transfer_drive_one(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    def transfer_drive_one(item: dict[str, Any]) -> tuple[dict[str, Any], bool, bool]:
         file_id = item["id"]
         filename = item["name"]
         mime = item.get("mimeType") or guess_image_mime(filename)
@@ -596,46 +754,39 @@ def main() -> None:
         if len(s_ts) >= 10 and s_ts[4:5] == ":" and s_ts[7:8] == ":":
             s_ts = s_ts.replace(":", "-", 2)
         fallback_iso = s_ts[:19]
-        meta = resolve_stem_sidecar_metadata(Path(filename).stem, sidecar_meta_map)
-        record = inspect_image_bytes(
-            img_bytes,
-            filename,
-            fallback_iso,
-            meta.get("timestamp"),
-            meta,
-        )
-
-        obj_name = f"{prefix}/{filename}" if prefix else filename
-        uploaded = _upload_if_changed(obj_name, img_bytes, mime)
-        return record, uploaded
+        return _process_and_sync_bytes(img_bytes, filename, fallback_iso, mime)
 
     records: list[dict[str, Any]] = []
     done_count = 0
     uploaded_count = 0
     skipped_count = 0
+    thumbs_uploaded_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         if args.local_dir is not None:
             futures = [pool.submit(transfer_local_one, p) for p in local_files]
         else:
             futures = [pool.submit(transfer_drive_one, item) for item in drive_files]
         for fut in concurrent.futures.as_completed(futures):
-            rec, was_uploaded = fut.result()
+            rec, was_uploaded, thumb_was_uploaded = fut.result()
             records.append(rec)
             done_count += 1
             if was_uploaded:
                 uploaded_count += 1
             else:
                 skipped_count += 1
+            if thumb_was_uploaded:
+                thumbs_uploaded_count += 1
             if done_count % 25 == 0 or done_count == total_items:
                 print(
                     f"      Processed {done_count}/{total_items} photos "
-                    f"({uploaded_count} uploaded, {skipped_count} unchanged in GCS)..."
+                    f"({uploaded_count} 3K uploaded, {skipped_count} unchanged, {thumbs_uploaded_count} thumbs uploaded)..."
                 )
 
     print(f"[5/5] Writing manifest.json and uploading to {remote_manifest_url} ...")
     manifest = finalize_manifest_from_records(
         records,
         base_url=base_url,
+        thumb_base_url=computed_thumb_base_url,
         remote_manifest_url=remote_manifest_url,
         title=existing_coll.get("title") or "",
         subtitle=existing_coll.get("subtitle") or "",
@@ -657,10 +808,11 @@ def main() -> None:
     top_cnt = sum(1 for p in manifest["photos"] if p.get("rating") == max_r) if max_r else 0
     print(
         f"Done! {len(records)} photos live at {base_url}/ "
-        f"({uploaded_count} uploaded, {skipped_count} unchanged; "
+        f"({uploaded_count} 3K uploaded, {skipped_count} unchanged, {thumbs_uploaded_count} thumbs uploaded; "
         f"{rated_total} rated, {top_cnt} at top {max_r or '-'}★ tier)."
     )
 
 
 if __name__ == "__main__":
     main()
+

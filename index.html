@@ -44,26 +44,46 @@
 
       <div class="toolbar-controls">
         <div class="segmented-group" role="group" aria-label="View filter">
-          <button id="filter-all" type="button" class="seg-btn is-active" data-filter="all">
-            All
-          </button>
-          <button id="filter-highlights" type="button" class="seg-btn" data-filter="highlights">
+          <button id="filter-highlights" type="button" class="seg-btn is-active" data-filter="highlights">
             Highlights
+          </button>
+          <button id="filter-shoots" type="button" class="seg-btn" data-filter="shoots">
+            Shoots
+          </button>
+          <button id="filter-archive" type="button" class="seg-btn" data-filter="archive">
+            Archive
           </button>
           <button id="filter-favorites" type="button" class="seg-btn" data-filter="favorites">
             Favorites
           </button>
         </div>
 
-        <button
-          id="btn-theme-toggle"
-          type="button"
-          class="icon-toggle-btn"
-          aria-label="Toggle light or dark appearance"
-          title="Switch light / dark appearance"
-        >
-          ◐
-        </button>
+        <div class="toolbar-utility-btns">
+          <button
+            id="btn-density-toggle"
+            type="button"
+            class="icon-toggle-btn"
+            aria-label="Toggle contact sheet or editorial layout"
+            title="Switch to Contact Sheet grid"
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true">
+              <rect x="1.2" y="1.2" width="4.6" height="4.6" rx="0.6" />
+              <rect x="8.2" y="1.2" width="4.6" height="4.6" rx="0.6" />
+              <rect x="1.2" y="8.2" width="4.6" height="4.6" rx="0.6" />
+              <rect x="8.2" y="8.2" width="4.6" height="4.6" rx="0.6" />
+            </svg>
+          </button>
+
+          <button
+            id="btn-theme-toggle"
+            type="button"
+            class="icon-toggle-btn"
+            aria-label="Toggle light or dark appearance"
+            title="Switch light / dark appearance"
+          >
+            ◐
+          </button>
+        </div>
       </div>
     </div>
   </nav>
@@ -75,7 +95,7 @@
   <main id="gallery-main" class="gallery-main">
     <div id="chapters-container"></div>
 
-    <div id="pagination-sentinel" class="pagination-sentinel">
+    <div id="pagination-sentinel" class="pagination-sentinel" hidden>
       <button id="btn-load-more" type="button" class="btn-ghost" hidden>
         Show More
       </button>

@@ -1,9 +1,11 @@
 /**
- * Lightsync Gallery — Single-Page Photograph Viewer
- * - Aspect-preserving editorial spreads & fluid justified row solver
- * - Cursor-proximity 2x magnification on hero carousel selectors
- * - Viewport-priority progressive blur-up hydration & DOM-preserving pagination
- * - Smooth chapter jumping & responsive sticky date navigation
+ * Lightsync Gallery — High-Scale Single-Page Photograph Viewer
+ * - Default Highlights (4★+) landing with Shoots (>12h sessions), Archive, and Favorites views
+ * - Editorial spreads + Contact Sheet density toggle with photo-anchored scroll preservation
+ * - Exact-height virtualized reel & offscreen bitmap LRU eviction for 2k–10k+ photo archives
+ * - Hierarchical Month + Active-Month Day timeline scrubber & sticky navigation
+ * - Two-tier image loading (800px WebP grid thumbs + 3K lightbox/hero masters)
+ * - Cursor-proximity 2x magnification & touch scrubbing on hero carousel selectors
  */
 
 (() => {
@@ -12,27 +14,92 @@
   const STORAGE_KEYS = {
     theme: "lightsync_gallery_theme",
     favorites: "lightsync_gallery_favorites",
+    density: "lightsync_gallery_density",
   };
 
-  const PAGE_BATCH_SIZE = 30;
   const MAX_CAROUSEL_SLIDES = 7;
   const HERO_PROXIMITY_RADIUS_PX = 165;
-  const MAX_CONCURRENT_HYDRATIONS = 6;
+  const MAX_CONCURRENT_HYDRATIONS = 8;
   const SESSION_GAP_MS = 12 * 60 * 60 * 1000;
+  const VIRTUAL_OVERSCAN_PX = 1250;
+  const DIVIDER_BLOCK_HEIGHT = 44;
+  const MAX_DECODED_CARDS = 220;
+  const FILMSTRIP_HALF_WINDOW = 40;
+
+  const SHORT_MONTHS = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const LONG_MONTHS = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+
+  const ICONS = {
+    compactGrid: `
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true">
+        <rect x="1.2" y="1.2" width="4.6" height="4.6" rx="0.6" />
+        <rect x="8.2" y="1.2" width="4.6" height="4.6" rx="0.6" />
+        <rect x="1.2" y="8.2" width="4.6" height="4.6" rx="0.6" />
+        <rect x="8.2" y="8.2" width="4.6" height="4.6" rx="0.6" />
+      </svg>
+    `,
+    editorialRows: `
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.35" aria-hidden="true">
+        <rect x="1.2" y="1.5" width="7.2" height="11" rx="0.6" />
+        <rect x="10.1" y="1.5" width="2.7" height="4.8" rx="0.5" />
+        <rect x="10.1" y="7.7" width="2.7" height="4.8" rx="0.5" />
+      </svg>
+    `,
+  };
 
   const state = {
     manifest: null,
     photos: [],
+    photoById: new Map(),
     chapters: [],
+    shoots: [],
+    shootById: new Map(),
     heroPhotos: [],
     assetBaseUrl: "./3k_exports",
+    thumbBaseUrl: "",
 
-    filter: "all", // 'all' | 'highlights' | 'favorites'
-    visibleCount: PAGE_BATCH_SIZE,
+    filter: "highlights", // 'highlights' | 'shoots' | 'archive' | 'favorites'
+    hasExplicitUrlView: false,
+    activeShootId: null,
+    shootsIndexScrollY: 0,
+    density: "editorial", // 'editorial' | 'compact'
 
     favorites: new Set(),
     hydratedIds: new Set(),
     activeDate: null,
+
+    layoutBlocks: [],
+    photoTopById: new Map(),
+    layoutTotalHeight: 0,
+    layoutKeySignature: "",
+    virtStartIdx: -1,
+    virtEndIdx: -1,
 
     heroSlideIdx: 0,
     heroTimer: null,
@@ -41,6 +108,8 @@
     lightboxList: [],
     lightboxIdx: 0,
     lightboxZoomed: false,
+    filmstripStart: -1,
+    filmstripEnd: -1,
   };
 
   const dom = {
@@ -57,16 +126,16 @@
 
     galleryNav: document.getElementById("gallery-nav"),
     dateChaptersNav: document.getElementById("date-chapters-nav"),
-    filterAll: document.getElementById("filter-all"),
     filterHighlights: document.getElementById("filter-highlights"),
+    filterShoots: document.getElementById("filter-shoots"),
+    filterArchive: document.getElementById("filter-archive"),
     filterFavorites: document.getElementById("filter-favorites"),
+    btnDensityToggle: document.getElementById("btn-density-toggle"),
     btnThemeToggle: document.getElementById("btn-theme-toggle"),
 
     timelineScrubber: document.getElementById("timeline-scrubber"),
     galleryMain: document.getElementById("gallery-main"),
     chaptersContainer: document.getElementById("chapters-container"),
-    paginationSentinel: document.getElementById("pagination-sentinel"),
-    btnLoadMore: document.getElementById("btn-load-more"),
 
     footer: document.querySelector(".gallery-footer"),
     footerCopyright: document.getElementById("footer-copyright"),
@@ -88,10 +157,12 @@
   };
 
   const cardCache = new Map(); // photoId -> { figure, hiImg, btnFav }
+  const decodedCardLru = new Set(); // photoId in insertion order for offscreen bitmap eviction
+  const mountedReelBlocks = new Map(); // blockKey -> HTMLElement
   const pendingHydrationSet = new Set();
 
+  let reelWrapEl = null;
   let imgObserver = null;
-  let sentinelObserver = null;
   let proximityRaf = 0;
   let scrollRaf = 0;
   let pumpRaf = 0;
@@ -99,14 +170,44 @@
   let activeHydrations = 0;
   let lastContainerWidth = 0;
   let lastDateNavKey = "";
+  let lastExpandedMonthKey = "";
   let suppressScrollObserversUntil = 0;
   let lastHeroDotsTouchTime = 0;
   let lastHeroSwipeTime = 0;
   let lastHeroOrientation = "";
 
   // =========================================================================
-  // Preferences & URL State
+  // Preferences, URL State & Asset Resolution
   // =========================================================================
+
+  function parseUrlViewState() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const rawView = (params.get("view") || "").toLowerCase();
+      const shootParam = params.get("shoot") || "";
+
+      if (shootParam) {
+        state.filter = "shoots";
+        state.activeShootId = shootParam;
+        state.hasExplicitUrlView = true;
+        return;
+      }
+
+      if (rawView === "all" || rawView === "archive") {
+        state.filter = "archive";
+        state.activeShootId = null;
+        state.hasExplicitUrlView = true;
+      } else if (["highlights", "shoots", "favorites"].includes(rawView)) {
+        state.filter = rawView;
+        state.activeShootId = null;
+        state.hasExplicitUrlView = true;
+      } else {
+        state.filter = "highlights";
+        state.activeShootId = null;
+        state.hasExplicitUrlView = false;
+      }
+    } catch (_) {}
+  }
 
   function loadPersistedState() {
     try {
@@ -114,19 +215,18 @@
       if (savedTheme === "dark" || savedTheme === "light") {
         dom.html.setAttribute("data-theme", savedTheme);
       }
+      const savedDensity = localStorage.getItem(STORAGE_KEYS.density);
+      if (savedDensity === "compact" || savedDensity === "editorial") {
+        state.density = savedDensity;
+      }
       const savedFavs = JSON.parse(localStorage.getItem(STORAGE_KEYS.favorites) || "[]");
       if (Array.isArray(savedFavs)) {
         state.favorites = new Set(savedFavs);
       }
     } catch (_) {}
 
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const view = params.get("view");
-      if (["all", "highlights", "favorites"].includes(view)) {
-        state.filter = view;
-      }
-    } catch (_) {}
+    parseUrlViewState();
+    syncDensityUI();
   }
 
   function saveFavorites() {
@@ -135,13 +235,41 @@
     } catch (_) {}
   }
 
-  function syncUrlParams() {
+  function syncUrlParams(pushHistory = false) {
     try {
       const url = new URL(window.location.href);
-      if (state.filter === "all") url.searchParams.delete("view");
-      else url.searchParams.set("view", state.filter);
-      window.history.replaceState({}, "", url.toString());
+      if (state.filter === "highlights") {
+        url.searchParams.delete("view");
+      } else {
+        url.searchParams.set("view", state.filter);
+      }
+
+      if (state.filter === "shoots" && state.activeShootId) {
+        url.searchParams.set("shoot", state.activeShootId);
+      } else {
+        url.searchParams.delete("shoot");
+      }
+
+      if (pushHistory) {
+        window.history.pushState({}, "", url.toString());
+      } else {
+        window.history.replaceState({}, "", url.toString());
+      }
     } catch (_) {}
+  }
+
+  function syncDensityUI() {
+    const isCompact = state.density === "compact";
+    if (dom.galleryMain) {
+      dom.galleryMain.classList.toggle("is-compact", isCompact);
+    }
+    if (dom.btnDensityToggle) {
+      dom.btnDensityToggle.classList.toggle("is-active", isCompact);
+      dom.btnDensityToggle.innerHTML = isCompact ? ICONS.editorialRows : ICONS.compactGrid;
+      dom.btnDensityToggle.title = isCompact
+        ? "Switch to Editorial layout"
+        : "Switch to Contact Sheet grid";
+    }
   }
 
   function resolvePhotoUrl(photo) {
@@ -151,12 +279,39 @@
     return `${base}/${photo.filename}`;
   }
 
-  function getFilteredPhotos() {
+  function resolveThumbUrl(photo) {
+    if (photo.embeddedSrc) return photo.embeddedSrc;
+    if (photo.thumbUrl && /^https?:\/\//i.test(photo.thumbUrl)) return photo.thumbUrl;
+    if (state.thumbBaseUrl && photo.thumb) {
+      const tBase = state.thumbBaseUrl.replace(/\/+$/, "");
+      return `${tBase}/${photo.thumb}`;
+    }
+    return resolvePhotoUrl(photo);
+  }
+
+  function formatCount(n) {
+    return Number(n || 0).toLocaleString();
+  }
+
+  function getActiveShoot() {
+    if (state.filter !== "shoots" || !state.activeShootId) return null;
+    return state.shootById.get(state.activeShootId) || null;
+  }
+
+  function isShootsIndexMode() {
+    return state.filter === "shoots" && !getActiveShoot();
+  }
+
+  function getReelPhotos() {
     if (state.filter === "highlights") {
       return state.photos.filter((p) => p.hero);
     }
     if (state.filter === "favorites") {
       return state.photos.filter((p) => state.favorites.has(p.id));
+    }
+    if (state.filter === "shoots") {
+      const shoot = getActiveShoot();
+      return shoot ? shoot.photos : [];
     }
     return state.photos;
   }
@@ -173,14 +328,157 @@
 
   function updateToolbarCounts() {
     const favCount = state.favorites.size;
+    const totalCount = state.photos.length;
+    const shootsCount = state.shoots.length;
 
-    dom.filterAll.textContent = state.photos.length > 0 ? `All (${state.photos.length})` : "All";
     dom.filterHighlights.textContent = "Highlights";
-    dom.filterFavorites.textContent = favCount > 0 ? `Favorites (${favCount})` : "Favorites";
+    dom.filterShoots.textContent =
+      shootsCount > 0 ? `Shoots (${formatCount(shootsCount)})` : "Shoots";
+    dom.filterArchive.textContent =
+      totalCount > 0 ? `Archive (${formatCount(totalCount)})` : "Archive";
+    dom.filterFavorites.textContent =
+      favCount > 0 ? `Favorites (${formatCount(favCount)})` : "Favorites";
 
-    dom.filterAll.classList.toggle("is-active", state.filter === "all");
     dom.filterHighlights.classList.toggle("is-active", state.filter === "highlights");
+    dom.filterShoots.classList.toggle("is-active", state.filter === "shoots");
+    dom.filterArchive.classList.toggle("is-active", state.filter === "archive");
     dom.filterFavorites.classList.toggle("is-active", state.filter === "favorites");
+  }
+
+  // =========================================================================
+  // Session / Shoot Derivation (>12h Gaps)
+  // =========================================================================
+
+  function parsePhotoTimestampMs(photo) {
+    if (!photo || typeof photo.timestamp !== "string") return NaN;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(
+      photo.timestamp.trim()
+    );
+    if (m) {
+      return Date.UTC(
+        Number(m[1]),
+        Number(m[2]) - 1,
+        Number(m[3]),
+        Number(m[4]),
+        Number(m[5]),
+        Number(m[6])
+      );
+    }
+    return Date.parse(photo.timestamp);
+  }
+
+  function groupPhotosIntoSessions(photos) {
+    const sessions = [];
+    for (let i = 0; i < photos.length; i++) {
+      const photo = photos[i];
+      if (i === 0) {
+        sessions.push([photo]);
+        continue;
+      }
+      const tPrev = parsePhotoTimestampMs(photos[i - 1]);
+      const tCurr = parsePhotoTimestampMs(photo);
+      const isNewSession =
+        Number.isFinite(tPrev) &&
+        Number.isFinite(tCurr) &&
+        Math.abs(tPrev - tCurr) > SESSION_GAP_MS;
+      if (isNewSession) {
+        sessions.push([photo]);
+      } else {
+        sessions[sessions.length - 1].push(photo);
+      }
+    }
+    return sessions;
+  }
+
+  function parseYmdParts(ymd) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ""));
+    if (!m) return null;
+    return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
+  }
+
+  function formatShootDateRange(oldestDate, newestDate) {
+    const a = parseYmdParts(oldestDate);
+    const b = parseYmdParts(newestDate);
+    if (!a || !b) return newestDate || oldestDate || "";
+
+    if (oldestDate === newestDate) {
+      return `${LONG_MONTHS[b.m - 1]} ${b.d}, ${b.y}`;
+    }
+    if (a.y === b.y && a.m === b.m) {
+      return `${LONG_MONTHS[a.m - 1]} ${a.d}–${b.d}, ${a.y}`;
+    }
+    if (a.y === b.y) {
+      return `${SHORT_MONTHS[a.m - 1]} ${a.d} – ${SHORT_MONTHS[b.m - 1]} ${b.d}, ${a.y}`;
+    }
+    return `${SHORT_MONTHS[a.m - 1]} ${a.d}, ${a.y} – ${SHORT_MONTHS[b.m - 1]} ${b.d}, ${b.y}`;
+  }
+
+  function pickShootPreviewPhotos(sessionPhotos) {
+    if (sessionPhotos.length <= 1) return sessionPhotos.slice();
+
+    let bestCover = sessionPhotos[0];
+    let bestScore = -Infinity;
+    for (const p of sessionPhotos) {
+      const score =
+        (typeof p.rating === "number" ? p.rating * 12 : 0) +
+        (p.hero ? 5 : 0) +
+        (isWellExposedForHero(p) ? 3 : 0) +
+        (p.orientation === "landscape" ? 1.5 : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCover = p;
+      }
+    }
+
+    const rest = sessionPhotos.filter((p) => p.id !== bestCover.id);
+    const maxRest = Math.min(3, rest.length);
+    const previews = [bestCover];
+    if (maxRest > 0) {
+      const preferredRest = rest.filter((p) => p.hero && isWellExposedForHero(p));
+      const pool = preferredRest.length >= maxRest ? preferredRest : rest;
+      for (let i = 0; i < maxRest; i++) {
+        const idx =
+          maxRest === 1 ? 0 : Math.floor((i * (pool.length - 1)) / (maxRest - 1));
+        previews.push(pool[idx]);
+      }
+    }
+    return previews;
+  }
+
+  function buildShootsFromPhotos(photos) {
+    const sessions = groupPhotosIntoSessions(photos);
+    const shoots = [];
+    const byId = new Map();
+
+    for (const sessionPhotos of sessions) {
+      if (!sessionPhotos.length) continue;
+      const newest = sessionPhotos[0];
+      const oldest = sessionPhotos[sessionPhotos.length - 1];
+      const id = `${newest.date}_${newest.id}`;
+      const datesSet = new Set(sessionPhotos.map((p) => p.date));
+      const shoot = {
+        id,
+        photos: sessionPhotos,
+        newestDate: newest.date,
+        oldestDate: oldest.date,
+        datesSet,
+        title: formatShootDateRange(oldest.date, newest.date),
+        countLabel:
+          sessionPhotos.length === 1
+            ? "1 photo"
+            : `${formatCount(sessionPhotos.length)} photos`,
+        previews: pickShootPreviewPhotos(sessionPhotos),
+      };
+      shoots.push(shoot);
+      byId.set(id, shoot);
+    }
+
+    state.shoots = shoots;
+    state.shootById = byId;
+
+    if (state.activeShootId && !byId.has(state.activeShootId)) {
+      state.activeShootId = null;
+    }
   }
 
   // =========================================================================
@@ -198,7 +496,7 @@
   function isWellExposedForHero(photo) {
     const lum = estimateHexLuminance(photo.dominantColor);
     const lqipLen = (photo.lqip || "").length;
-    return lum >= 28 && lqipLen >= 300;
+    return lum >= 26 && lqipLen >= 100;
   }
 
   function getDesiredHeroOrientation() {
@@ -356,7 +654,7 @@
 
       slide.addEventListener("click", () => {
         if (performance.now() - lastHeroSwipeTime < 450) return;
-        openLightboxByPhotoId(photo.id);
+        openLightboxByPhotoId(photo.id, state.heroPhotos);
       });
       dom.heroSlidesLayer.appendChild(slide);
 
@@ -472,7 +770,7 @@
   }
 
   // =========================================================================
-  // 2. Date Navigation & Timeline Scrubber (Shown Only When 2+ Dates Exist)
+  // 2. Hierarchical Year → Month → Day Navigation & Timeline Scrubber
   // =========================================================================
 
   function syncScrubberVisibility() {
@@ -488,15 +786,133 @@
     dom.timelineScrubber.classList.toggle("is-visible", heroRect.bottom <= 4);
   }
 
-  function renderDateNavigation(filteredPhotos) {
+  function formatMonthLabel(monthKey) {
+    const m = /^(\d{4})-(\d{2})$/.exec(monthKey);
+    if (!m) return monthKey;
+    const yrShort = m[1].slice(2);
+    const moIdx = Math.max(0, Math.min(11, Number(m[2]) - 1));
+    return `${SHORT_MONTHS[moIdx]} '${yrShort}`;
+  }
+
+  function buildMonthBuckets(activeChapters) {
+    const buckets = [];
+    const byKey = new Map();
+    for (const ch of activeChapters) {
+      const mKey = String(ch.date || "").slice(0, 7);
+      let b = byKey.get(mKey);
+      if (!b) {
+        b = {
+          monthKey: mKey,
+          label: formatMonthLabel(mKey),
+          firstDate: ch.date,
+          chapters: [],
+        };
+        byKey.set(mKey, b);
+        buckets.push(b);
+      }
+      b.chapters.push(ch);
+    }
+    return buckets;
+  }
+
+  function getActiveNavContextPhotos() {
+    if (getActiveShoot()) return [];
+    if (isShootsIndexMode()) return state.photos;
+    return getReelPhotos();
+  }
+
+  function populateScrubberTicks(activeChapters, monthBuckets, activeDate) {
+    dom.timelineScrubber.replaceChildren();
+
+    if (activeChapters.length <= 8) {
+      lastExpandedMonthKey = "*flat*";
+      for (const ch of activeChapters) {
+        const isCurrent = activeDate === ch.date;
+        const tick = document.createElement("button");
+        tick.type = "button";
+        tick.className = `scrubber-tick${isCurrent ? " is-active" : ""}`;
+        tick.dataset.date = ch.date;
+        tick.innerHTML = `
+          <span class="scrubber-label">${ch.label}</span>
+          <span class="scrubber-line"></span>
+        `;
+        tick.addEventListener("click", () => jumpToDateChapter(ch.date));
+        dom.timelineScrubber.appendChild(tick);
+      }
+      return;
+    }
+
+    const activeMonthKey = String(activeDate || "").slice(0, 7);
+    lastExpandedMonthKey = activeMonthKey;
+
+    for (const bucket of monthBuckets) {
+      const isActiveMonth = bucket.monthKey === activeMonthKey;
+      const mTick = document.createElement("button");
+      mTick.type = "button";
+      mTick.className = `scrubber-tick is-month${isActiveMonth ? " is-active" : ""}`;
+      mTick.dataset.month = bucket.monthKey;
+      mTick.dataset.date = bucket.firstDate;
+      mTick.innerHTML = `
+        <span class="scrubber-label">${bucket.label}</span>
+        <span class="scrubber-line"></span>
+      `;
+      mTick.addEventListener("click", () => jumpToDateChapter(bucket.firstDate));
+      dom.timelineScrubber.appendChild(mTick);
+
+      if (isActiveMonth && bucket.chapters.length > 1) {
+        const maxSubTicks = 10;
+        let subChapters = bucket.chapters;
+        if (subChapters.length > maxSubTicks) {
+          const sampled = [];
+          for (let i = 0; i < maxSubTicks; i++) {
+            const idx = Math.floor((i * (subChapters.length - 1)) / (maxSubTicks - 1));
+            sampled.push(subChapters[idx]);
+          }
+          if (!sampled.some((c) => c.date === activeDate)) {
+            const exact = subChapters.find((c) => c.date === activeDate);
+            if (exact) sampled[0] = exact;
+          }
+          subChapters = sampled;
+        }
+
+        for (const ch of subChapters) {
+          const isDayCurrent = ch.date === activeDate;
+          const dTick = document.createElement("button");
+          dTick.type = "button";
+          dTick.className = `scrubber-tick is-day-sub${isDayCurrent ? " is-active" : ""}`;
+          dTick.dataset.date = ch.date;
+          dTick.innerHTML = `
+            <span class="scrubber-label">${ch.label}</span>
+            <span class="scrubber-line"></span>
+          `;
+          dTick.addEventListener("click", () => jumpToDateChapter(ch.date));
+          dom.timelineScrubber.appendChild(dTick);
+        }
+      }
+    }
+  }
+
+  function renderDateNavigation(contextPhotos) {
+    if (!contextPhotos || contextPhotos.length === 0) {
+      lastDateNavKey = "";
+      lastExpandedMonthKey = "";
+      dom.dateChaptersNav.replaceChildren();
+      dom.timelineScrubber.replaceChildren();
+      dom.dateChaptersNav.hidden = true;
+      dom.timelineScrubber.hidden = true;
+      dom.timelineScrubber.classList.remove("is-visible");
+      return;
+    }
+
     const countsByDate = new Map();
-    for (const p of filteredPhotos) {
+    for (const p of contextPhotos) {
       countsByDate.set(p.date, (countsByDate.get(p.date) || 0) + 1);
     }
 
     const activeChapters = state.chapters.filter((ch) => countsByDate.has(ch.date));
     if (activeChapters.length <= 1) {
       lastDateNavKey = "";
+      lastExpandedMonthKey = "";
       dom.dateChaptersNav.replaceChildren();
       dom.timelineScrubber.replaceChildren();
       dom.dateChaptersNav.hidden = true;
@@ -509,55 +925,76 @@
       state.activeDate = activeChapters[0].date;
     }
 
-    const navKey = activeChapters.map((ch) => `${ch.date}:${ch.label}`).join("|");
+    const monthBuckets = buildMonthBuckets(activeChapters);
+    const useMonthPills = activeChapters.length > 6 && monthBuckets.length > 1;
+    const navKey = `${useMonthPills ? "M" : "D"}:${activeChapters.map((ch) => ch.date).join("|")}`;
+
     dom.dateChaptersNav.hidden = false;
     dom.timelineScrubber.hidden = false;
     syncScrubberVisibility();
 
     if (navKey === lastDateNavKey) {
-      highlightActiveDateUI(state.activeDate, false);
+      highlightActiveDateUI(state.activeDate, false, activeChapters, monthBuckets);
       return;
     }
 
     lastDateNavKey = navKey;
     dom.dateChaptersNav.replaceChildren();
-    dom.timelineScrubber.replaceChildren();
 
-    activeChapters.forEach((ch) => {
-      const isCurrent = state.activeDate === ch.date;
+    if (useMonthPills) {
+      const activeMonth = String(state.activeDate || "").slice(0, 7);
+      for (const bucket of monthBuckets) {
+        const pill = document.createElement("button");
+        pill.type = "button";
+        pill.className = `nav-pill${bucket.monthKey === activeMonth ? " is-active" : ""}`;
+        pill.dataset.month = bucket.monthKey;
+        pill.dataset.date = bucket.firstDate;
+        pill.textContent = bucket.label;
+        pill.addEventListener("click", () => jumpToDateChapter(bucket.firstDate));
+        dom.dateChaptersNav.appendChild(pill);
+      }
+    } else {
+      for (const ch of activeChapters) {
+        const pill = document.createElement("button");
+        pill.type = "button";
+        pill.className = `nav-pill${state.activeDate === ch.date ? " is-active" : ""}`;
+        pill.dataset.date = ch.date;
+        pill.textContent = ch.label;
+        pill.addEventListener("click", () => jumpToDateChapter(ch.date));
+        dom.dateChaptersNav.appendChild(pill);
+      }
+    }
 
-      const pill = document.createElement("button");
-      pill.type = "button";
-      pill.className = `nav-pill${isCurrent ? " is-active" : ""}`;
-      pill.dataset.date = ch.date;
-      pill.textContent = ch.label;
-      pill.addEventListener("click", () => jumpToDateChapter(ch.date));
-      dom.dateChaptersNav.appendChild(pill);
-
-      const tick = document.createElement("button");
-      tick.type = "button";
-      tick.className = `scrubber-tick${isCurrent ? " is-active" : ""}`;
-      tick.dataset.date = ch.date;
-      tick.innerHTML = `
-        <span class="scrubber-label">${ch.label}</span>
-        <span class="scrubber-line"></span>
-      `;
-      tick.addEventListener("click", () => jumpToDateChapter(ch.date));
-      dom.timelineScrubber.appendChild(tick);
-    });
+    populateScrubberTicks(activeChapters, monthBuckets, state.activeDate);
   }
 
-  function highlightActiveDateUI(dateKey, centerStrip = true) {
+  function highlightActiveDateUI(dateKey, centerStrip = true, cachedChapters = null, cachedBuckets = null) {
+    const activeMonth = String(dateKey || "").slice(0, 7);
     let activePill = null;
+
     dom.dateChaptersNav.querySelectorAll(".nav-pill").forEach((btn) => {
-      const match = btn.dataset.date === dateKey;
+      const match = btn.dataset.month
+        ? btn.dataset.month === activeMonth
+        : btn.dataset.date === dateKey;
       btn.classList.toggle("is-active", match);
       if (match) activePill = btn;
     });
 
-    dom.timelineScrubber.querySelectorAll(".scrubber-tick").forEach((btn) => {
-      btn.classList.toggle("is-active", btn.dataset.date === dateKey);
-    });
+    if (lastExpandedMonthKey && lastExpandedMonthKey !== "*flat*" && lastExpandedMonthKey !== activeMonth) {
+      const ctxPhotos = getActiveNavContextPhotos();
+      const countsByDate = new Map();
+      for (const p of ctxPhotos) countsByDate.set(p.date, 1);
+      const activeChs = cachedChapters || state.chapters.filter((ch) => countsByDate.has(ch.date));
+      const buckets = cachedBuckets || buildMonthBuckets(activeChs);
+      populateScrubberTicks(activeChs, buckets, dateKey);
+    } else {
+      dom.timelineScrubber.querySelectorAll(".scrubber-tick").forEach((btn) => {
+        const match = btn.classList.contains("is-month")
+          ? btn.dataset.month === activeMonth
+          : btn.dataset.date === dateKey;
+        btn.classList.toggle("is-active", match);
+      });
+    }
 
     if (centerStrip && activePill && !dom.dateChaptersNav.hidden) {
       const strip = dom.dateChaptersNav;
@@ -573,64 +1010,70 @@
     clearTimeout(postJumpTimer);
     postJumpTimer = setTimeout(() => {
       suppressScrollObserversUntil = 0;
+      syncVirtualReelDOM();
       schedulePumpHydration();
-      checkSentinelIfVisible();
     }, delayMs);
   }
 
+  function scrollSmoothWithLongApproach(targetTop) {
+    const clampedTop = Math.max(0, targetTop);
+    const dist = Math.abs(clampedTop - window.scrollY);
+
+    if (dist > window.innerHeight * 2.5) {
+      const approachOffset = Math.min(220, Math.round(window.innerHeight * 0.28));
+      const approachTop =
+        clampedTop > window.scrollY
+          ? Math.max(0, clampedTop - approachOffset)
+          : clampedTop + approachOffset;
+      window.scrollTo({ top: approachTop, behavior: "instant" });
+      syncVirtualReelDOM();
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: clampedTop, behavior: "smooth" });
+        scheduleHydrationAfterJump(420);
+      });
+    } else {
+      window.scrollTo({ top: clampedTop, behavior: "smooth" });
+      scheduleHydrationAfterJump(420);
+    }
+  }
+
   function jumpToDateChapter(dateKey) {
-    const filtered = getFilteredPhotos();
-    const firstIdx = filtered.findIndex((p) => p.date === dateKey);
-    if (firstIdx === -1) return;
-    const targetPhoto = filtered[firstIdx];
-
-    let minNeeded = Math.min(filtered.length, firstIdx + PAGE_BATCH_SIZE);
-    if (filtered.length - minNeeded <= PAGE_BATCH_SIZE) {
-      minNeeded = filtered.length;
-    }
-
     suppressScrollObserversUntil = performance.now() + 900;
-
-    if (state.visibleCount < minNeeded) {
-      state.visibleCount = minNeeded;
-      renderGallery();
-    }
-
     state.activeDate = dateKey;
     highlightActiveDateUI(dateKey, true);
 
+    if (isShootsIndexMode()) {
+      requestAnimationFrame(() => {
+        const navH = syncNavHeight();
+        const cards = Array.from(dom.chaptersContainer.querySelectorAll(".shoot-card"));
+        const targetCard =
+          cards.find((el) => {
+            const shoot = state.shootById.get(el.dataset.shootId);
+            return shoot && shoot.datesSet.has(dateKey);
+          }) ||
+          cards.find((el) => {
+            const shoot = state.shootById.get(el.dataset.shootId);
+            return shoot && shoot.newestDate <= dateKey;
+          });
+        if (!targetCard) return;
+        const targetTop =
+          window.scrollY + targetCard.getBoundingClientRect().top - navH - 14;
+        scrollSmoothWithLongApproach(targetTop);
+      });
+      return;
+    }
+
+    const reelPhotos = getReelPhotos();
+    const targetPhoto = reelPhotos.find((p) => p.date === dateKey);
+    if (!targetPhoto || !reelWrapEl) return;
+
+    const offsetY = state.photoTopById.get(targetPhoto.id);
+    if (offsetY === undefined) return;
+
     requestAnimationFrame(() => {
       const navH = syncNavHeight();
-      const entry = cardCache.get(targetPhoto.id);
-      const targetEl = entry && entry.figure;
-      if (!targetEl || !targetEl.isConnected) return;
-
-      const targetTop = Math.max(
-        0,
-        window.scrollY + targetEl.getBoundingClientRect().top - navH - 12
-      );
-      const dist = Math.abs(targetTop - window.scrollY);
-
-      if (dist > window.innerHeight * 2.5) {
-        const approachOffset = Math.min(220, Math.round(window.innerHeight * 0.28));
-        const approachTop =
-          targetTop > window.scrollY
-            ? Math.max(0, targetTop - approachOffset)
-            : targetTop + approachOffset;
-        window.scrollTo({ top: approachTop, behavior: "instant" });
-        requestAnimationFrame(() => {
-          const settledNavH = syncNavHeight();
-          const finalTop = Math.max(
-            0,
-            window.scrollY + targetEl.getBoundingClientRect().top - settledNavH - 12
-          );
-          window.scrollTo({ top: finalTop, behavior: "smooth" });
-          scheduleHydrationAfterJump(420);
-        });
-      } else {
-        window.scrollTo({ top: targetTop, behavior: "smooth" });
-        scheduleHydrationAfterJump(420);
-      }
+      const reelOriginTop = window.scrollY + reelWrapEl.getBoundingClientRect().top;
+      scrollSmoothWithLongApproach(reelOriginTop + offsetY - navH - 12);
     });
   }
 
@@ -638,24 +1081,71 @@
     if (performance.now() < suppressScrollObserversUntil) return;
     if (dom.dateChaptersNav.hidden) return;
 
-    const filtered = getFilteredPhotos();
-    const limit = Math.min(state.visibleCount, filtered.length);
-    if (limit === 0) return;
-
     const navH = dom.galleryNav ? dom.galleryNav.getBoundingClientRect().height : 58;
     const thresholdY = navH + 56;
 
-    let candidate = filtered[0].date;
-    for (let i = 0; i < limit; i++) {
-      const p = filtered[i];
-      const entry = cardCache.get(p.id);
-      if (!entry || !entry.figure.isConnected) continue;
-      const top = entry.figure.getBoundingClientRect().top;
-      if (top <= thresholdY) {
-        candidate = p.date;
-      } else if (top > thresholdY + 820) {
-        break;
+    if (isShootsIndexMode()) {
+      const cards = dom.chaptersContainer.querySelectorAll(".shoot-card");
+      if (!cards.length) return;
+      let candidate = null;
+      for (const card of cards) {
+        const rect = card.getBoundingClientRect();
+        if (rect.top <= thresholdY + 40) {
+          const shoot = state.shootById.get(card.dataset.shootId);
+          if (shoot) candidate = shoot.newestDate;
+        } else {
+          break;
+        }
       }
+      if (!candidate) {
+        const firstShoot = state.shootById.get(cards[0].dataset.shootId);
+        if (firstShoot) candidate = firstShoot.newestDate;
+      }
+      if (candidate && candidate !== state.activeDate) {
+        state.activeDate = candidate;
+        highlightActiveDateUI(candidate, true);
+      }
+      return;
+    }
+
+    const blocks = state.layoutBlocks;
+    if (!blocks.length || !reelWrapEl) return;
+
+    const relThreshold = thresholdY - reelWrapEl.getBoundingClientRect().top;
+    if (relThreshold <= 0) {
+      const firstPhotoBlock = blocks.find((b) => b.firstDate);
+      const firstDate = firstPhotoBlock && firstPhotoBlock.firstDate;
+      if (firstDate && firstDate !== state.activeDate) {
+        state.activeDate = firstDate;
+        highlightActiveDateUI(firstDate, true);
+      }
+      return;
+    }
+
+    // Binary search last block with b.top <= relThreshold
+    let lo = 0;
+    let hi = blocks.length - 1;
+    let bestIdx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (blocks[mid].top <= relThreshold) {
+        bestIdx = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+
+    let candidate = null;
+    for (let i = bestIdx; i >= 0; i--) {
+      const b = blocks[i];
+      if (!b.photoEntries || !b.photoEntries.length) continue;
+      for (const pe of b.photoEntries) {
+        if (pe.top <= relThreshold) {
+          candidate = pe.photo.date;
+        }
+      }
+      if (candidate) break;
     }
 
     if (candidate && candidate !== state.activeDate) {
@@ -665,7 +1155,7 @@
   }
 
   // =========================================================================
-  // 3. Aspect-Preserving Auto-Layout Engine (Hero Spreads + Justified Rows)
+  // 3. Aspect-Preserving Auto-Layout Engine (Editorial + Contact Sheet)
   // =========================================================================
 
   function getContainerInnerWidth() {
@@ -680,25 +1170,36 @@
     return Math.min(1400, Math.max(280, fallbackViewport - 32));
   }
 
-  function getTargetRowHeight(containerWidth) {
+  function getTargetRowHeight(containerWidth, isCompact = false) {
+    if (isCompact) {
+      if (containerWidth < 560) return 104;
+      if (containerWidth < 900) return 128;
+      return 154;
+    }
     if (containerWidth < 560) return 230;
     if (containerWidth < 900) return 300;
     return 390;
   }
 
   function makeRowBlock(items, height, clamped) {
+    const hRounded = Math.round(height * 100) / 100;
     const ids = items.map((x) => x.photo.id).join(",");
     return {
       type: "row",
       clamped: Boolean(clamped),
-      key: `r:${clamped ? 1 : 0}:${Math.round(height * 10)}:${ids}`,
+      height: hRounded,
+      key: `r:${clamped ? 1 : 0}:${Math.round(hRounded * 10)}:${ids}`,
       items,
+      firstDate: items[0] ? items[0].photo.date : "",
     };
   }
 
-  function solveJustifiedRows(photos, containerWidth, gutter) {
-    const targetH = getTargetRowHeight(containerWidth);
-    const maxSingleH = Math.min(520, Math.round(window.innerHeight * 0.68));
+  function solveJustifiedRows(photos, containerWidth, gutter, isCompact = false) {
+    const targetH = getTargetRowHeight(containerWidth, isCompact);
+    const maxPerRow = isCompact ? 9 : 4;
+    const maxSingleH = isCompact
+      ? Math.round(targetH * 1.45)
+      : Math.min(520, Math.round((window.innerHeight || 800) * 0.68));
     const blocks = [];
 
     let row = [];
@@ -709,11 +1210,11 @@
       row.push(p);
       aspectSum += p.aspect;
 
-      const availW = containerWidth - gutter * (row.length - 1);
+      const availW = Math.max(80, containerWidth - gutter * (row.length - 1));
       const naturalH = availW / aspectSum;
       const isLast = i === photos.length - 1;
 
-      if (naturalH <= targetH * 1.16 || row.length >= 4) {
+      if (naturalH <= targetH * 1.16 || row.length >= maxPerRow) {
         blocks.push(
           makeRowBlock(
             row.map((item) => ({
@@ -765,9 +1266,9 @@
     const wStack = (containerWidth - gutter * (1 + aH)) / (1 + aH * invSum);
     if (wStack < 165) return null;
 
-    const h1 = wStack / a1;
-    const h2 = wStack / a2;
-    const totalH = h1 + h2 + gutter;
+    const h1 = Math.round((wStack / a1) * 100) / 100;
+    const h2 = Math.round((wStack / a2) * 100) / 100;
+    const totalH = Math.round((h1 + h2 + gutter) * 100) / 100;
     const wHero = containerWidth - gutter - wStack;
 
     if (totalH < 330 || totalH > 760 || wHero < 280) {
@@ -777,6 +1278,7 @@
     return {
       type: "spread",
       heroOnRight,
+      height: totalH,
       key: `s:${heroOnRight ? 1 : 0}:${Math.round(totalH * 10)}:${hero.id}:${companions[0].id},${companions[1].id}`,
       heroItem: { photo: hero, width: wHero, height: totalH },
       stackWidth: wStack,
@@ -784,12 +1286,15 @@
         { photo: companions[0], width: wStack, height: h1 },
         { photo: companions[1], width: wStack, height: h2 },
       ],
+      sliceOrder: slice,
+      firstDate: slice[0].date,
     };
   }
 
   function solveAutoLayout(photos, containerWidth, gutter) {
-    if (containerWidth < 680 || state.filter === "highlights") {
-      return solveJustifiedRows(photos, containerWidth, gutter);
+    const isCompact = state.density === "compact";
+    if (isCompact || containerWidth < 680 || state.filter === "highlights") {
+      return solveJustifiedRows(photos, containerWidth, gutter, isCompact);
     }
 
     const blocks = [];
@@ -824,20 +1329,97 @@
 
         const aspectSum = rowSlice.reduce((acc, p) => acc + p.aspect, 0);
         const estH = (containerWidth - gutter * (rowSlice.length - 1)) / aspectSum;
-        if (estH <= getTargetRowHeight(containerWidth) * 1.15) {
+        if (estH <= getTargetRowHeight(containerWidth, false) * 1.15) {
           break;
         }
       }
 
-      blocks.push(...solveJustifiedRows(rowSlice, containerWidth, gutter));
+      blocks.push(...solveJustifiedRows(rowSlice, containerWidth, gutter, false));
     }
 
     return blocks;
   }
 
+  function computeReelLayout(photos, containerWidth) {
+    const isCompact = state.density === "compact";
+    const gutter = isCompact ? 6 : 12;
+    const sessions = groupPhotosIntoSessions(photos);
+    const blocks = [];
+
+    for (let sIdx = 0; sIdx < sessions.length; sIdx++) {
+      if (sIdx > 0) {
+        const prevSession = sessions[sIdx - 1];
+        const prevPhoto = prevSession[prevSession.length - 1];
+        const nextPhoto = sessions[sIdx][0];
+        blocks.push({
+          type: "divider",
+          height: DIVIDER_BLOCK_HEIGHT,
+          key: `div:${prevPhoto.id}:${nextPhoto.id}`,
+          firstDate: "",
+          photoEntries: [],
+        });
+      }
+      blocks.push(...solveAutoLayout(sessions[sIdx], containerWidth, gutter));
+    }
+
+    const photoTopById = new Map();
+    let cursorY = 0;
+
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      b.top = cursorY;
+
+      if (b.type === "row") {
+        b.photoEntries = b.items.map((it) => {
+          photoTopById.set(it.photo.id, b.top);
+          return { photo: it.photo, top: b.top };
+        });
+      } else if (b.type === "spread") {
+        const topMap = new Map();
+        topMap.set(b.heroItem.photo.id, b.top);
+        topMap.set(b.stackItems[0].photo.id, b.top);
+        topMap.set(
+          b.stackItems[1].photo.id,
+          b.top + b.stackItems[0].height + gutter
+        );
+        b.photoEntries = b.sliceOrder.map((p) => {
+          const pTop = topMap.get(p.id) ?? b.top;
+          photoTopById.set(p.id, pTop);
+          return { photo: p, top: pTop };
+        });
+      }
+
+      cursorY = Math.round((cursorY + b.height + (i < blocks.length - 1 ? gutter : 0)) * 100) / 100;
+    }
+
+    return {
+      blocks,
+      photoTopById,
+      totalHeight: Math.max(0, cursorY),
+    };
+  }
+
   // =========================================================================
-  // 4. Cached Photo Cards & Viewport-Priority Hydration Queue
+  // 4. Cached Photo Cards, Hydration Queue & Offscreen Bitmap LRU Eviction
   // =========================================================================
+
+  function touchDecodedCard(photoId) {
+    decodedCardLru.delete(photoId);
+    decodedCardLru.add(photoId);
+  }
+
+  function evictOffscreenBitmaps() {
+    if (decodedCardLru.size <= MAX_DECODED_CARDS) return;
+    for (const oldId of decodedCardLru) {
+      if (decodedCardLru.size <= MAX_DECODED_CARDS) break;
+      const entry = cardCache.get(oldId);
+      if (!entry || entry.figure.isConnected) continue;
+      entry.hiImg.removeAttribute("src");
+      delete entry.hiImg.dataset.fallbackTried;
+      entry.figure.classList.remove("is-loaded");
+      decodedCardLru.delete(oldId);
+    }
+  }
 
   function syncCardFavoriteButton(photoId) {
     const cached = cardCache.get(photoId);
@@ -855,6 +1437,7 @@
       figure.className = "photo-card";
       figure.style.margin = "0";
       figure.style.setProperty("--tile-bg", photo.dominantColor || "#1c1917");
+      figure.style.setProperty("--focal-pos", getPhotoFocalPosition(photo));
 
       const lqipImg = document.createElement("img");
       lqipImg.className = "photo-lqip";
@@ -904,16 +1487,9 @@
 
     syncCardFavoriteButton(photo.id);
 
-    if (state.hydratedIds.has(photo.id)) {
-      if (!entry.hiImg.getAttribute("src")) {
-        entry.hiImg.src = resolvePhotoUrl(photo);
-      }
-      entry.figure.classList.add("is-loaded");
-    } else if (
-      !entry.hiImg.getAttribute("src") &&
-      !pendingHydrationSet.has(entry.hiImg) &&
-      imgObserver
-    ) {
+    if (entry.hiImg.getAttribute("src")) {
+      touchDecodedCard(photo.id);
+    } else if (!pendingHydrationSet.has(entry.hiImg) && imgObserver) {
       imgObserver.observe(entry.hiImg);
     }
 
@@ -923,8 +1499,11 @@
   function startImageHydration(imgEl) {
     const photoId = imgEl.dataset.photoId;
     if (!photoId || imgEl.getAttribute("src")) return;
-    const photo = state.photos.find((p) => p.id === photoId);
+    const photo = state.photoById.get(photoId);
     if (!photo) return;
+
+    const primaryUrl = resolveThumbUrl(photo);
+    const fallbackMasterUrl = resolvePhotoUrl(photo);
 
     activeHydrations += 1;
     let settled = false;
@@ -936,9 +1515,11 @@
       activeHydrations = Math.max(0, activeHydrations - 1);
 
       if (ok) {
-        const card = imgEl.closest(".photo-card");
-        if (card) card.classList.add("is-loaded");
-        state.hydratedIds.add(photoId);
+        const tile = imgEl.closest(".photo-card, .shoot-cell");
+        if (tile) tile.classList.add("is-loaded");
+        if (tile && tile.classList.contains("photo-card")) {
+          touchDecodedCard(photoId);
+        }
       } else {
         imgEl.removeAttribute("src");
         if (imgEl.isConnected && imgObserver) {
@@ -964,9 +1545,20 @@
       }
     };
 
+    const onError = () => {
+      if (imgEl.dataset.fallbackTried !== "1" && primaryUrl !== fallbackMasterUrl) {
+        imgEl.dataset.fallbackTried = "1";
+        imgEl.addEventListener("load", onLoaded, { once: true });
+        imgEl.addEventListener("error", () => finalize(false), { once: true });
+        imgEl.src = fallbackMasterUrl;
+        return;
+      }
+      finalize(false);
+    };
+
     imgEl.addEventListener("load", onLoaded, { once: true });
-    imgEl.addEventListener("error", () => finalize(false), { once: true });
-    imgEl.src = resolvePhotoUrl(photo);
+    imgEl.addEventListener("error", onError, { once: true });
+    imgEl.src = primaryUrl;
 
     if (imgEl.complete && imgEl.naturalWidth > 0) {
       onLoaded();
@@ -1003,7 +1595,7 @@
       }
 
       const rect = imgEl.getBoundingClientRect();
-      if (rect.bottom < -520 || rect.top > vh + 520) {
+      if (rect.bottom < -600 || rect.top > vh + 600) {
         pendingHydrationSet.delete(imgEl);
         if (imgObserver) imgObserver.observe(imgEl);
         continue;
@@ -1024,20 +1616,6 @@
     }
   }
 
-  function checkSentinelIfVisible() {
-    if (performance.now() < suppressScrollObserversUntil) return;
-    if (!dom.paginationSentinel) return;
-    const total = getFilteredPhotos().length;
-    if (state.visibleCount >= total) return;
-
-    const rect = dom.paginationSentinel.getBoundingClientRect();
-    const vh = window.innerHeight || 800;
-    if (rect.top <= vh + 360) {
-      state.visibleCount = Math.min(total, state.visibleCount + PAGE_BATCH_SIZE);
-      renderGallery();
-    }
-  }
-
   function setupObservers() {
     if (imgObserver) imgObserver.disconnect();
     imgObserver = new IntersectionObserver(
@@ -1050,72 +1628,13 @@
         }
         schedulePumpHydration();
       },
-      { rootMargin: "300px 0px" }
-    );
-
-    if (sentinelObserver) sentinelObserver.disconnect();
-    sentinelObserver = new IntersectionObserver(
-      (entries) => {
-        if (performance.now() < suppressScrollObserversUntil) return;
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            const total = getFilteredPhotos().length;
-            if (state.visibleCount < total) {
-              state.visibleCount = Math.min(total, state.visibleCount + PAGE_BATCH_SIZE);
-              renderGallery();
-            }
-          }
-        }
-      },
       { rootMargin: "420px 0px" }
     );
-    sentinelObserver.observe(dom.paginationSentinel);
   }
 
   // =========================================================================
-  // 5. Incremental Non-Destructive Gallery Rendering
+  // 5. Virtualized Reel & Shoots Index Rendering
   // =========================================================================
-
-  function parsePhotoTimestampMs(photo) {
-    if (!photo || typeof photo.timestamp !== "string") return NaN;
-    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(
-      photo.timestamp.trim()
-    );
-    if (m) {
-      return Date.UTC(
-        Number(m[1]),
-        Number(m[2]) - 1,
-        Number(m[3]),
-        Number(m[4]),
-        Number(m[5]),
-        Number(m[6])
-      );
-    }
-    return Date.parse(photo.timestamp);
-  }
-
-  function groupPhotosIntoSessions(photos) {
-    const sessions = [];
-    for (let i = 0; i < photos.length; i++) {
-      const photo = photos[i];
-      if (i === 0) {
-        sessions.push([photo]);
-        continue;
-      }
-      const tPrev = parsePhotoTimestampMs(photos[i - 1]);
-      const tCurr = parsePhotoTimestampMs(photo);
-      const isNewSession =
-        Number.isFinite(tPrev) &&
-        Number.isFinite(tCurr) &&
-        Math.abs(tPrev - tCurr) > SESSION_GAP_MS;
-      if (isNewSession) {
-        sessions.push([photo]);
-      } else {
-        sessions[sessions.length - 1].push(photo);
-      }
-    }
-    return sessions;
-  }
 
   function buildSingleBlockDOM(block) {
     if (block.type === "divider") {
@@ -1177,91 +1696,325 @@
     return rowEl;
   }
 
-  function reconcileBlocksContainer(rowsWrap, blocks) {
-    for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i];
-      const existing = rowsWrap.children[i];
-      if (existing && existing.dataset.blockKey === block.key) {
-        continue;
-      }
-      const nextEl = buildSingleBlockDOM(block);
-      if (existing) {
-        rowsWrap.replaceChild(nextEl, existing);
+  function clearMountedReel() {
+    mountedReelBlocks.clear();
+    state.virtStartIdx = -1;
+    state.virtEndIdx = -1;
+    reelWrapEl = null;
+  }
+
+  function syncVirtualReelDOM(forceUpdate = false) {
+    if (!reelWrapEl || !reelWrapEl.isConnected) return;
+    const blocks = state.layoutBlocks;
+    if (!blocks.length) {
+      reelWrapEl.replaceChildren();
+      mountedReelBlocks.clear();
+      return;
+    }
+
+    const vh = window.innerHeight || 800;
+    const reelRectTop = reelWrapEl.getBoundingClientRect().top;
+    const viewMinY = -reelRectTop - VIRTUAL_OVERSCAN_PX;
+    const viewMaxY = -reelRectTop + vh + VIRTUAL_OVERSCAN_PX;
+
+    // Binary search first block where b.top + b.height >= viewMinY
+    let lo = 0;
+    let hi = blocks.length - 1;
+    let startIdx = blocks.length;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (blocks[mid].top + blocks[mid].height >= viewMinY) {
+        startIdx = mid;
+        hi = mid - 1;
       } else {
-        rowsWrap.appendChild(nextEl);
+        lo = mid + 1;
+      }
+    }
+    if (startIdx >= blocks.length) startIdx = blocks.length - 1;
+
+    // Advance endIdx while b.top <= viewMaxY
+    let endIdx = startIdx;
+    while (endIdx + 1 < blocks.length && blocks[endIdx + 1].top <= viewMaxY) {
+      endIdx += 1;
+    }
+
+    if (
+      !forceUpdate &&
+      startIdx === state.virtStartIdx &&
+      endIdx === state.virtEndIdx
+    ) {
+      return;
+    }
+
+    state.virtStartIdx = startIdx;
+    state.virtEndIdx = endIdx;
+
+    const wantedKeys = new Set();
+    for (let i = startIdx; i <= endIdx; i++) {
+      wantedKeys.add(blocks[i].key);
+    }
+
+    for (const [key, el] of mountedReelBlocks) {
+      if (!wantedKeys.has(key)) {
+        el.remove();
+        mountedReelBlocks.delete(key);
       }
     }
 
-    while (rowsWrap.children.length > blocks.length) {
-      rowsWrap.lastElementChild.remove();
+    for (let i = startIdx; i <= endIdx; i++) {
+      const b = blocks[i];
+      let el = mountedReelBlocks.get(b.key);
+      if (!el) {
+        el = buildSingleBlockDOM(b);
+        el.style.position = "absolute";
+        el.style.left = "0";
+        el.style.right = "0";
+        mountedReelBlocks.set(b.key, el);
+        reelWrapEl.appendChild(el);
+      } else {
+        // Re-ensure cards inside existing block remain observed if evicted earlier
+        el.querySelectorAll(".photo-hi").forEach((imgEl) => {
+          if (!imgEl.getAttribute("src") && !pendingHydrationSet.has(imgEl) && imgObserver) {
+            imgObserver.observe(imgEl);
+          }
+        });
+      }
+      el.style.top = `${b.top.toFixed(2)}px`;
+      el.style.height = `${b.height.toFixed(2)}px`;
+    }
+
+    evictOffscreenBitmaps();
+    schedulePumpHydration();
+  }
+
+  function captureViewportAnchorPhotoId() {
+    if (!reelWrapEl || !state.layoutBlocks.length) return null;
+    const navH = dom.galleryNav ? dom.galleryNav.getBoundingClientRect().height : 58;
+    const relY = navH + 24 - reelWrapEl.getBoundingClientRect().top;
+    if (relY < 40) return null;
+
+    let lo = 0;
+    let hi = state.layoutBlocks.length - 1;
+    let best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (state.layoutBlocks[mid].top <= relY) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+
+    for (let i = best; i < state.layoutBlocks.length; i++) {
+      const b = state.layoutBlocks[i];
+      if (b.photoEntries && b.photoEntries.length > 0) {
+        return b.photoEntries[0].photo.id;
+      }
+    }
+    return null;
+  }
+
+  function openShootDetail(shootId, pushHistory = true) {
+    if (!state.shootById.has(shootId)) return;
+    state.shootsIndexScrollY = window.scrollY;
+    state.filter = "shoots";
+    state.activeShootId = shootId;
+    state.activeDate = null;
+    syncUrlParams(pushHistory);
+    renderGallery(true);
+
+    requestAnimationFrame(() => {
+      const navH = syncNavHeight();
+      const mainTop = window.scrollY + dom.galleryMain.getBoundingClientRect().top - navH + 4;
+      if (window.scrollY > mainTop) {
+        window.scrollTo({ top: Math.max(0, mainTop), behavior: "instant" });
+      }
+      syncVirtualReelDOM(true);
+    });
+  }
+
+  function closeShootDetail(pushHistory = true) {
+    const restoreY = state.shootsIndexScrollY;
+    state.activeShootId = null;
+    state.activeDate = null;
+    syncUrlParams(pushHistory);
+    renderGallery(true);
+
+    if (restoreY > 0) {
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: restoreY, behavior: "instant" });
+        schedulePumpHydration();
+      });
     }
   }
 
-  function renderGallery() {
-    const filtered = getFilteredPhotos();
+  function buildShootCardDOM(shoot) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "shoot-card";
+    btn.dataset.shootId = shoot.id;
+
+    const collage = document.createElement("div");
+    collage.className = "shoot-collage";
+    collage.dataset.count = String(Math.max(1, Math.min(4, shoot.previews.length)));
+
+    for (const p of shoot.previews) {
+      const cell = document.createElement("div");
+      cell.className = "shoot-cell";
+      cell.style.setProperty("--tile-bg", p.dominantColor || "#1c1917");
+      cell.style.setProperty("--focal-pos", getPhotoFocalPosition(p));
+
+      if (p.lqip) {
+        const lqip = document.createElement("img");
+        lqip.className = "photo-lqip";
+        lqip.src = p.lqip;
+        lqip.alt = "";
+        lqip.setAttribute("aria-hidden", "true");
+        cell.appendChild(lqip);
+      }
+
+      const hi = document.createElement("img");
+      hi.className = "photo-hi";
+      hi.alt = p.filename;
+      hi.decoding = "async";
+      hi.dataset.photoId = p.id;
+      cell.appendChild(hi);
+      if (imgObserver) imgObserver.observe(hi);
+
+      collage.appendChild(cell);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "shoot-meta";
+
+    const titleSpan = document.createElement("span");
+    titleSpan.className = "shoot-title";
+    titleSpan.textContent = shoot.title;
+
+    const countSpan = document.createElement("span");
+    countSpan.className = "shoot-count";
+    countSpan.textContent = shoot.countLabel;
+
+    meta.append(titleSpan, countSpan);
+    btn.append(collage, meta);
+
+    btn.addEventListener("click", () => openShootDetail(shoot.id, true));
+    return btn;
+  }
+
+  function renderShootsIndex() {
+    clearMountedReel();
+    state.layoutBlocks = [];
+    state.photoTopById = new Map();
+
+    if (dom.chaptersContainer.dataset.mode !== "shoots-index") {
+      dom.chaptersContainer.replaceChildren();
+      dom.chaptersContainer.dataset.mode = "shoots-index";
+      const grid = document.createElement("div");
+      grid.className = "shoots-grid";
+      for (const shoot of state.shoots) {
+        grid.appendChild(buildShootCardDOM(shoot));
+      }
+      dom.chaptersContainer.appendChild(grid);
+    }
+
+    schedulePumpHydration();
+  }
+
+  function renderGallery(forceRemount = false) {
     updateToolbarCounts();
-    renderDateNavigation(filtered);
+    syncDensityUI();
+
+    if (isShootsIndexMode()) {
+      renderDateNavigation(state.photos);
+      syncNavHeight();
+      renderShootsIndex();
+      return;
+    }
+
+    const activeShoot = getActiveShoot();
+    const filtered = getReelPhotos();
+    renderDateNavigation(activeShoot ? [] : filtered);
     syncNavHeight();
 
     if (filtered.length === 0) {
-      if (dom.chaptersContainer.dataset.mode !== "empty") {
-        dom.chaptersContainer.replaceChildren();
-        dom.chaptersContainer.dataset.mode = "empty";
-        const empty = document.createElement("div");
-        empty.className = "empty-state";
-        empty.innerHTML = `
-          <h3>No saved favorites yet</h3>
-          <p>Click ♡ on any photograph to add it to your favorites.</p>
-        `;
-        dom.chaptersContainer.appendChild(empty);
-      }
-      dom.btnLoadMore.hidden = true;
+      clearMountedReel();
+      state.layoutBlocks = [];
+      state.photoTopById = new Map();
+      dom.chaptersContainer.replaceChildren();
+      dom.chaptersContainer.dataset.mode = "empty";
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.innerHTML =
+        state.filter === "favorites"
+          ? `
+            <h3>No saved favorites yet</h3>
+            <p>Click ♡ on any photograph to add it to your favorites.</p>
+          `
+          : `
+            <h3>No photographs in this view</h3>
+            <p>Switch to Archive to browse all photographs.</p>
+          `;
+      dom.chaptersContainer.appendChild(empty);
       return;
     }
 
     const containerWidth = getContainerInnerWidth();
     lastContainerWidth = containerWidth;
-    const gutter = 12;
 
-    const visibleSlice = filtered.slice(0, state.visibleCount);
-
-    if (dom.chaptersContainer.dataset.mode !== "reel") {
+    const wantMode = activeShoot ? `shoot:${activeShoot.id}` : "reel";
+    if (dom.chaptersContainer.dataset.mode !== wantMode || forceRemount) {
+      clearMountedReel();
       dom.chaptersContainer.replaceChildren();
-      dom.chaptersContainer.dataset.mode = "reel";
-      const rowsWrap = document.createElement("div");
-      rowsWrap.className = "chapter-rows";
-      dom.chaptersContainer.appendChild(rowsWrap);
-    }
+      dom.chaptersContainer.dataset.mode = wantMode;
 
-    const rowsWrap = dom.chaptersContainer.firstElementChild;
-    const sessions = groupPhotosIntoSessions(visibleSlice);
-    const blocks = [];
+      if (activeShoot) {
+        const detailBar = document.createElement("div");
+        detailBar.className = "shoot-detail-bar";
 
-    for (let sIdx = 0; sIdx < sessions.length; sIdx++) {
-      if (sIdx > 0) {
-        const prevSession = sessions[sIdx - 1];
-        const prevPhoto = prevSession[prevSession.length - 1];
-        const nextPhoto = sessions[sIdx][0];
-        blocks.push({
-          type: "divider",
-          key: `div:${prevPhoto.id}:${nextPhoto.id}`,
-        });
+        const backBtn = document.createElement("button");
+        backBtn.type = "button";
+        backBtn.className = "shoot-back-btn";
+        backBtn.textContent = "← All Shoots";
+        backBtn.addEventListener("click", () => closeShootDetail(true));
+
+        const detailMeta = document.createElement("div");
+        detailMeta.className = "shoot-detail-meta";
+        const titleEl = document.createElement("span");
+        titleEl.className = "shoot-detail-title";
+        titleEl.textContent = activeShoot.title;
+        const countEl = document.createElement("span");
+        countEl.className = "shoot-detail-count";
+        countEl.textContent = activeShoot.countLabel;
+        detailMeta.append(titleEl, countEl);
+
+        detailBar.append(backBtn, detailMeta);
+        dom.chaptersContainer.appendChild(detailBar);
       }
-      blocks.push(...solveAutoLayout(sessions[sIdx], containerWidth, gutter));
+
+      reelWrapEl = document.createElement("div");
+      reelWrapEl.className = "virtual-reel";
+      dom.chaptersContainer.appendChild(reelWrapEl);
+    } else if (!reelWrapEl) {
+      reelWrapEl = dom.chaptersContainer.querySelector(".virtual-reel");
     }
 
-    reconcileBlocksContainer(rowsWrap, blocks);
+    const layout = computeReelLayout(filtered, containerWidth);
+    state.layoutBlocks = layout.blocks;
+    state.photoTopById = layout.photoTopById;
+    state.layoutTotalHeight = layout.totalHeight;
+    reelWrapEl.style.height = `${layout.totalHeight.toFixed(2)}px`;
 
-    dom.btnLoadMore.hidden = visibleSlice.length >= filtered.length;
-    schedulePumpHydration();
+    syncVirtualReelDOM(true);
   }
 
   // =========================================================================
-  // 6. Favorites & Lightbox
+  // 6. Favorites & Windowed Lightbox
   // =========================================================================
 
   function togglePhotoFavorite(photoId) {
-    const photo = state.photos.find((p) => p.id === photoId);
+    const photo = state.photoById.get(photoId);
     if (!photo) return;
 
     if (state.favorites.has(photoId)) {
@@ -1282,20 +2035,27 @@
     if (state.lightboxOpen) syncLightboxControls();
   }
 
-  function openLightboxByPhotoId(photoId) {
-    const list = getFilteredPhotos();
-    const idx = list.findIndex((p) => p.id === photoId);
-    if (idx === -1) return;
+  function openLightboxByPhotoId(photoId, explicitList = null) {
+    const baseList = explicitList || getReelPhotos();
+    const list = baseList.length > 0 ? baseList : state.photos;
+    let idx = list.findIndex((p) => p.id === photoId);
+    if (idx === -1) {
+      idx = state.photos.findIndex((p) => p.id === photoId);
+      if (idx === -1) return;
+      state.lightboxList = state.photos;
+    } else {
+      state.lightboxList = list;
+    }
 
-    state.lightboxList = list;
     state.lightboxIdx = idx;
     state.lightboxOpen = true;
+    state.filmstripStart = -1;
+    state.filmstripEnd = -1;
     setLightboxZoom(false);
 
     dom.lightbox.classList.add("is-open");
     document.body.style.overflow = "hidden";
 
-    renderLightboxFilmstrip();
     updateLightboxSlide();
   }
 
@@ -1315,13 +2075,13 @@
   }
 
   function setLightboxZoom(zoomed) {
-    state.lightboxZoomed = zoomed;
-    dom.lbImgWrap.classList.toggle("is-zoomed", zoomed);
-    dom.lbBtnZoom.classList.toggle("is-active", zoomed);
-    dom.lbBtnZoom.innerHTML = zoomed
+    state.lightboxZoomed = Boolean(zoomed);
+    dom.lbImgWrap.classList.toggle("is-zoomed", state.lightboxZoomed);
+    dom.lbBtnZoom.classList.toggle("is-active", state.lightboxZoomed);
+    dom.lbBtnZoom.innerHTML = state.lightboxZoomed
       ? '<span aria-hidden="true">⊖</span><span class="lb-btn-label">Fit</span>'
       : '<span aria-hidden="true">⊕</span><span class="lb-btn-label">Zoom</span>';
-    if (!zoomed) {
+    if (!state.lightboxZoomed) {
       dom.lbImg.style.transformOrigin = "center center";
     }
   }
@@ -1339,6 +2099,73 @@
     }
   }
 
+  function syncLightboxFilmstripWindow() {
+    const len = state.lightboxList.length;
+    if (!len) {
+      dom.lbFilmstrip.replaceChildren();
+      return;
+    }
+
+    const totalWindow = FILMSTRIP_HALF_WINDOW * 2 + 1;
+    let wantStart = 0;
+    let wantEnd = len - 1;
+    if (len > totalWindow) {
+      wantStart = Math.max(
+        0,
+        Math.min(len - totalWindow, state.lightboxIdx - FILMSTRIP_HALF_WINDOW)
+      );
+      wantEnd = wantStart + totalWindow - 1;
+    }
+
+    const needsRebuild =
+      state.filmstripStart === -1 ||
+      (len <= totalWindow && (state.filmstripStart !== 0 || state.filmstripEnd !== len - 1)) ||
+      (len > totalWindow &&
+        (state.lightboxIdx < state.filmstripStart + 8 ||
+          state.lightboxIdx > state.filmstripEnd - 8));
+
+    if (needsRebuild) {
+      state.filmstripStart = wantStart;
+      state.filmstripEnd = wantEnd;
+      dom.lbFilmstrip.replaceChildren();
+
+      for (let idx = wantStart; idx <= wantEnd; idx++) {
+        const photo = state.lightboxList[idx];
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `lb-thumb${idx === state.lightboxIdx ? " is-active" : ""}`;
+        btn.dataset.lbIdx = String(idx);
+        const img = document.createElement("img");
+        img.src = photo.lqip || resolveThumbUrl(photo);
+        img.alt = photo.filename;
+        btn.appendChild(img);
+        btn.addEventListener("click", () => {
+          setLightboxZoom(false);
+          state.lightboxIdx = idx;
+          updateLightboxSlide();
+        });
+        dom.lbFilmstrip.appendChild(btn);
+      }
+    }
+
+    let activeThumb = null;
+    for (const el of dom.lbFilmstrip.children) {
+      const isCurrent = Number(el.dataset.lbIdx) === state.lightboxIdx;
+      el.classList.toggle("is-active", isCurrent);
+      if (isCurrent) activeThumb = el;
+    }
+
+    if (activeThumb) {
+      const targetLeft =
+        activeThumb.offsetLeft -
+        (dom.lbFilmstrip.clientWidth - activeThumb.offsetWidth) * 0.5;
+      dom.lbFilmstrip.scrollTo({
+        left: Math.max(0, targetLeft),
+        behavior: needsRebuild ? "instant" : "smooth",
+      });
+    }
+  }
+
   function updateLightboxSlide() {
     const photo = state.lightboxList[state.lightboxIdx];
     if (!photo) return;
@@ -1348,7 +2175,7 @@
     dom.lbImg.alt = photo.filename;
     state.hydratedIds.add(photo.id);
 
-    dom.lbCounter.textContent = `${state.lightboxIdx + 1} / ${state.lightboxList.length}`;
+    dom.lbCounter.textContent = `${formatCount(state.lightboxIdx + 1)} / ${formatCount(state.lightboxList.length)}`;
     dom.lbTitle.textContent = photo.filename;
 
     dom.lbBtnDownload.href = url;
@@ -1356,18 +2183,7 @@
 
     syncLightboxControls();
     preloadNeighborLightboxSlides();
-
-    const activeThumb = dom.lbFilmstrip.children[state.lightboxIdx];
-    dom.lbFilmstrip.querySelectorAll(".lb-thumb.is-active").forEach((el) => {
-      if (el !== activeThumb) el.classList.remove("is-active");
-    });
-    if (activeThumb) {
-      activeThumb.classList.add("is-active");
-      const targetLeft =
-        activeThumb.offsetLeft -
-        (dom.lbFilmstrip.clientWidth - activeThumb.offsetWidth) * 0.5;
-      dom.lbFilmstrip.scrollTo({ left: Math.max(0, targetLeft), behavior: "smooth" });
-    }
+    syncLightboxFilmstripWindow();
   }
 
   function syncLightboxControls() {
@@ -1378,25 +2194,6 @@
     dom.lbBtnFav.innerHTML = isFav
       ? '<span aria-hidden="true">♥</span><span class="lb-btn-label">Favorited</span>'
       : '<span aria-hidden="true">♡</span><span class="lb-btn-label">Favorite</span>';
-  }
-
-  function renderLightboxFilmstrip() {
-    dom.lbFilmstrip.replaceChildren();
-    state.lightboxList.forEach((photo, idx) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = `lb-thumb${idx === state.lightboxIdx ? " is-active" : ""}`;
-      const img = document.createElement("img");
-      img.src = photo.lqip;
-      img.alt = photo.filename;
-      btn.appendChild(img);
-      btn.addEventListener("click", () => {
-        setLightboxZoom(false);
-        state.lightboxIdx = idx;
-        updateLightboxSlide();
-      });
-      dom.lbFilmstrip.appendChild(btn);
-    });
   }
 
   // =========================================================================
@@ -1441,28 +2238,67 @@
     );
   }
 
+  function toggleDensityMode() {
+    const anchorPhotoId = !isShootsIndexMode() ? captureViewportAnchorPhotoId() : null;
+    state.density = state.density === "compact" ? "editorial" : "compact";
+    try {
+      localStorage.setItem(STORAGE_KEYS.density, state.density);
+    } catch (_) {}
+
+    syncDensityUI();
+
+    if (isShootsIndexMode()) return;
+
+    renderGallery(false);
+
+    if (anchorPhotoId && reelWrapEl && state.photoTopById.has(anchorPhotoId)) {
+      const navH = syncNavHeight();
+      const reelOriginTop = window.scrollY + reelWrapEl.getBoundingClientRect().top;
+      const nextOffset = state.photoTopById.get(anchorPhotoId);
+      suppressScrollObserversUntil = performance.now() + 260;
+      window.scrollTo({
+        top: Math.max(0, reelOriginTop + nextOffset - navH - 18),
+        behavior: "instant",
+      });
+      syncVirtualReelDOM(true);
+    }
+  }
+
   function bindEvents() {
     dom.btnExplore.addEventListener("click", () => {
       const targetTop = dom.heroStage ? dom.heroStage.offsetHeight : 0;
       window.scrollTo({ top: targetTop, behavior: "smooth" });
     });
 
-    [dom.filterAll, dom.filterHighlights, dom.filterFavorites].forEach((btn) => {
-      btn.addEventListener("click", () => {
-        if (state.filter === btn.dataset.filter) return;
-        state.filter = btn.dataset.filter;
-        state.visibleCount = PAGE_BATCH_SIZE;
-        state.activeDate = null;
-        syncUrlParams();
-        renderGallery();
-      });
+    [dom.filterHighlights, dom.filterShoots, dom.filterArchive, dom.filterFavorites].forEach(
+      (btn) => {
+        if (!btn) return;
+        btn.addEventListener("click", () => {
+          const nextFilter = btn.dataset.filter;
+          if (state.filter === nextFilter) {
+            if (nextFilter === "shoots" && state.activeShootId) {
+              closeShootDetail(true);
+            }
+            return;
+          }
+          state.filter = nextFilter;
+          state.activeShootId = null;
+          state.activeDate = null;
+          syncUrlParams(true);
+          renderGallery(true);
+        });
+      }
+    );
+
+    window.addEventListener("popstate", () => {
+      parseUrlViewState();
+      state.activeDate = null;
+      renderGallery(true);
     });
 
-    dom.btnLoadMore.addEventListener("click", () => {
-      const total = getFilteredPhotos().length;
-      state.visibleCount = Math.min(total, state.visibleCount + PAGE_BATCH_SIZE);
-      renderGallery();
-    });
+    if (dom.btnDensityToggle) {
+      dom.btnDensityToggle.addEventListener("click", toggleDensityMode);
+    }
 
     dom.btnThemeToggle.addEventListener("click", () => {
       const next = dom.html.getAttribute("data-theme") === "dark" ? "light" : "dark";
@@ -1606,6 +2442,7 @@
         scrollRaf = requestAnimationFrame(() => {
           scrollRaf = 0;
           syncScrubberVisibility();
+          syncVirtualReelDOM();
           updateActiveChapterFromScroll();
           schedulePumpHydration();
         });
@@ -1622,8 +2459,8 @@
         renderHeroCover();
       }
       const w = getContainerInnerWidth();
-      if (Math.abs(w - lastContainerWidth) > 2) {
-        renderGallery();
+      if (!isShootsIndexMode() && Math.abs(w - lastContainerWidth) > 2) {
+        renderGallery(false);
       }
     });
     galleryRo.observe(dom.galleryMain);
@@ -1727,16 +2564,44 @@
           String(b.timestamp || "").localeCompare(String(a.timestamp || "")) ||
           String(b.id || "").localeCompare(String(a.id || ""))
       );
-      state.chapters = [...(manifest.chapters || [])].sort((a, b) =>
+      state.photoById = new Map(state.photos.map((p) => [p.id, p]));
+      let rawChapters = Array.isArray(manifest.chapters) ? manifest.chapters : [];
+      if (!rawChapters.length && state.photos.length) {
+        const seenDates = new Map();
+        for (const p of state.photos) {
+          if (p.date) seenDates.set(p.date, (seenDates.get(p.date) || 0) + 1);
+        }
+        const multiYear = new Set([...seenDates.keys()].map((d) => d.slice(0, 4))).size > 1;
+        rawChapters = [...seenDates.entries()].map(([dKey, cnt]) => {
+          const p = parseYmdParts(dKey);
+          const label = p
+            ? `${SHORT_MONTHS[p.m - 1]} ${String(p.d).padStart(2, "0")}${multiYear ? `, '${String(p.y).slice(-2)}` : ""}`
+            : dKey;
+          const fullDate = p ? `${LONG_MONTHS[p.m - 1]} ${p.d}, ${p.y}` : dKey;
+          return { date: dKey, label, fullDate, count: cnt };
+        });
+      }
+      state.chapters = [...rawChapters].sort((a, b) =>
         String(b.date || "").localeCompare(String(a.date || ""))
       );
       state.assetBaseUrl =
         (manifest.collection && manifest.collection.assetBaseUrl) || "./3k_exports";
+      state.thumbBaseUrl =
+        (manifest.collection && manifest.collection.thumbBaseUrl) || "";
+
+      buildShootsFromPhotos(state.photos);
+
+      if (
+        state.filter === "highlights" &&
+        !state.hasExplicitUrlView &&
+        !state.photos.some((p) => p.hero)
+      ) {
+        state.filter = "archive";
+      }
 
       applyCollectionHeader(manifest.collection);
       renderHeroCover();
-      renderGallery();
-      checkSentinelIfVisible();
+      renderGallery(true);
     } catch (_) {
       dom.chaptersContainer.innerHTML = `
         <div class="empty-state">

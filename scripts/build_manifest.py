@@ -14,7 +14,7 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import Any
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 
 RAW_AND_SIDECAR_EXTS = {
@@ -470,16 +470,35 @@ def resolve_stem_capture_timestamp(stem: str, capture_map: dict[str, str]) -> st
 
 def make_lqip_and_color(im: Image.Image) -> tuple[str, str]:
     thumb = im.copy()
-    thumb.thumbnail((36, 36), Image.Resampling.LANCZOS)
+    thumb.thumbnail((24, 24), Image.Resampling.LANCZOS)
     if thumb.mode != "RGB":
         thumb = thumb.convert("RGB")
     buf = io.BytesIO()
-    thumb.save(buf, format="WEBP", quality=68)
+    thumb.save(buf, format="WEBP", quality=52)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
     px = thumb.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
     dom_hex = f"#{px[0]:02x}{px[1]:02x}{px[2]:02x}"
     return f"data:image/webp;base64,{b64}", dom_hex
+
+
+def make_grid_thumb_webp(
+    im_or_bytes: Image.Image | bytes,
+    max_edge: int = 800,
+    quality: int = 80,
+) -> bytes:
+    if isinstance(im_or_bytes, (bytes, bytearray, memoryview)):
+        with Image.open(io.BytesIO(im_or_bytes)) as opened:
+            upright = ImageOps.exif_transpose(opened)
+            return make_grid_thumb_webp(upright, max_edge=max_edge, quality=quality)
+
+    thumb = im_or_bytes.copy()
+    thumb.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    if thumb.mode != "RGB":
+        thumb = thumb.convert("RGB")
+    buf = io.BytesIO()
+    thumb.save(buf, format="WEBP", quality=quality, method=4)
+    return buf.getvalue()
 
 
 def format_date_labels(day_key: str, multi_year: bool = False) -> tuple[str, str]:
@@ -495,6 +514,7 @@ def finalize_manifest_from_records(
     raw_photos: list[dict[str, Any]],
     *,
     base_url: str = "./3k_exports",
+    thumb_base_url: str = "",
     remote_manifest_url: str = "",
     title: str = "",
     subtitle: str = "",
@@ -565,6 +585,8 @@ def finalize_manifest_from_records(
         "totalPhotos": len(raw_photos),
         "dateRange": date_range,
     }
+    if thumb_base_url:
+        collection_obj["thumbBaseUrl"] = thumb_base_url.rstrip("/")
     if max_rating > 0:
         collection_obj["maxRating"] = max_rating
     if title:
@@ -583,22 +605,32 @@ def finalize_manifest_from_records(
     }
 
 
-def inspect_image_bytes(
+def _inspect_image_core(
     data: bytes,
     filename: str,
     fallback_iso_ts: str,
     explicit_capture_ts: str | None = None,
     sidecar_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    *,
+    build_thumb: bool = False,
+    thumb_max_edge: int = 800,
+    thumb_quality: int = 80,
+) -> tuple[dict[str, Any], bytes | None]:
     stem = Path(filename).stem
     raw_head = data[:262144]
     meta = sidecar_meta or {}
+    thumb_bytes: bytes | None = None
 
     with Image.open(io.BytesIO(data)) as im:
-        width, height = im.size
         exif_dt = extract_exif_or_xmp_datetime(im, raw_head)
-        lqip, dom_color = make_lqip_and_color(im)
-        saliency_fp = compute_subject_focal_point(im)
+        upright = ImageOps.exif_transpose(im)
+        width, height = upright.size
+        lqip, dom_color = make_lqip_and_color(upright)
+        saliency_fp = compute_subject_focal_point(upright)
+        if build_thumb:
+            thumb_bytes = make_grid_thumb_webp(
+                upright, max_edge=thumb_max_edge, quality=thumb_quality
+            )
 
     iso_ts = exif_dt or explicit_capture_ts or meta.get("timestamp") or fallback_iso_ts
     day_key = iso_ts[:10]
@@ -609,7 +641,7 @@ def inspect_image_bytes(
     embedded_fp = extract_xmp_focal_point(raw_head)
     focal_point = meta.get("focalPoint") or embedded_fp or saliency_fp
 
-    return {
+    record: dict[str, Any] = {
         "id": stem,
         "filename": filename,
         "timestamp": iso_ts,
@@ -623,6 +655,51 @@ def inspect_image_bytes(
         "lqip": lqip,
         "_rating": rating,
     }
+    if build_thumb:
+        record["thumb"] = f"{stem}.webp"
+    return record, thumb_bytes
+
+
+def inspect_image_bytes(
+    data: bytes,
+    filename: str,
+    fallback_iso_ts: str,
+    explicit_capture_ts: str | None = None,
+    sidecar_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record, _ = _inspect_image_core(
+        data,
+        filename,
+        fallback_iso_ts,
+        explicit_capture_ts,
+        sidecar_meta,
+        build_thumb=False,
+    )
+    return record
+
+
+def inspect_image_with_thumb(
+    data: bytes,
+    filename: str,
+    fallback_iso_ts: str,
+    explicit_capture_ts: str | None = None,
+    sidecar_meta: dict[str, Any] | None = None,
+    *,
+    thumb_max_edge: int = 800,
+    thumb_quality: int = 80,
+) -> tuple[dict[str, Any], bytes]:
+    record, thumb_bytes = _inspect_image_core(
+        data,
+        filename,
+        fallback_iso_ts,
+        explicit_capture_ts,
+        sidecar_meta,
+        build_thumb=True,
+        thumb_max_edge=thumb_max_edge,
+        thumb_quality=thumb_quality,
+    )
+    assert thumb_bytes is not None
+    return record, thumb_bytes
 
 
 def parse_args() -> argparse.Namespace:
@@ -632,6 +709,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Directory containing exported .jpg/.webp photographs",
+    )
+    parser.add_argument(
+        "--thumbs-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to write 800px WebP grid thumbnails (<stem>.webp)",
+    )
+    parser.add_argument(
+        "--thumb-base-url",
+        default="",
+        help="Public base URL for 800px WebP grid thumbnails (defaults to ./thumbs when --thumbs-dir is specified)",
     )
     parser.add_argument(
         "--drive-metadata-json",
@@ -713,6 +801,9 @@ def main() -> None:
         all_paths.extend(Path(p) for p in glob.glob(str(args.images_dir / pat)))
     paths = sorted(set(all_paths))
 
+    if args.thumbs_dir is not None:
+        args.thumbs_dir.mkdir(parents=True, exist_ok=True)
+
     raw_photos: list[dict[str, Any]] = []
     for path in paths:
         if path.stem in excluded_stems:
@@ -722,19 +813,36 @@ def main() -> None:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
             fallback_dt = mtime.strftime("%Y-%m-%dT%H:%M:%S")
         meta = resolve_stem_sidecar_metadata(path.stem, sidecar_meta_map)
-        raw_photos.append(
-            inspect_image_bytes(
-                path.read_bytes(),
+        img_bytes = path.read_bytes()
+        if args.thumbs_dir is not None:
+            rec, thumb_bytes = inspect_image_with_thumb(
+                img_bytes,
                 path.name,
                 fallback_dt,
                 meta.get("timestamp"),
                 meta,
             )
-        )
+            (args.thumbs_dir / rec["thumb"]).write_bytes(thumb_bytes)
+            raw_photos.append(rec)
+        else:
+            raw_photos.append(
+                inspect_image_bytes(
+                    img_bytes,
+                    path.name,
+                    fallback_dt,
+                    meta.get("timestamp"),
+                    meta,
+                )
+            )
+
+    thumb_base_url = args.thumb_base_url
+    if not thumb_base_url and args.thumbs_dir is not None:
+        thumb_base_url = "./thumbs"
 
     manifest = finalize_manifest_from_records(
         raw_photos,
         base_url=args.base_url,
+        thumb_base_url=thumb_base_url,
         remote_manifest_url=args.remote_manifest_url,
         title=args.title,
         subtitle=args.subtitle,
@@ -752,3 +860,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

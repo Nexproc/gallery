@@ -1,20 +1,20 @@
 # lightsync-gallery
 
-Static single-page photography gallery published via GitHub Pages (`https://www.nicktitcombe.com/lightsync-gallery/`) and backed by Google Cloud Storage (`3k_exports`).
+Static single-page photography gallery published via GitHub Pages (`https://www.nicktitcombe.com/lightsync-gallery/`) and backed by Google Cloud Storage (`3k_exports` + `thumbs`).
 
 ## Features
 
-- **Aspect-Preserving Auto-Layout:** Combines asymmetric Hero spreads (1 full-height highlight paired alongside 2 stacked companions) with zero-crop justified rows.
-- **Proximity-Scaled Hero Carousel:** Full-bleed opening cover with carousel selectors that smoothly double in size as the cursor approaches.
-- **Automatic Date Navigation:** Sticky date pills and a right-edge timeline rail appear automatically whenever multiple capture/export dates exist.
-- **Progressive Blur-Up & Lazy Hydration:** Pre-allocates exact aspect boxes from `manifest.json` with inline 36px WebP placeholders and hydrates full-resolution masters via `IntersectionObserver`.
-- **Fullscreen Zoom Lightbox & Local Favorites:** Cursor-panning zoom, keyboard navigation (`←`, `→`, `Z`, `F`, `Esc`), direct downloads, and browser-saved `Favorites` filtering.
+- **Highlights-First Curation & Views:** Lands on a curated `Highlights` (`4★+`) editorial reel with instant switching to `Shoots` (automatic `> 12h` capture-session cover cards with drill-down), `Archive` (every photograph), and browser-saved `Favorites`.
+- **Editorial Spreads ↔ Contact Sheet Density Toggle:** Switch between full-bleed asymmetric Hero spreads / justified rows and a compact zero-crop Contact Sheet (~6–9 photos per row) while preserving scroll position on the exact photograph in view.
+- **Virtualized Reel & 2-Tier Thumbnails for 2k–10k+ Archives:** Pre-computes exact pixel coordinates up front, mounts only rows near the viewport, evicts offscreen decoded bitmaps via LRU, hydrates `800px` WebP grid thumbnails (`thumbs/*.webp`) with automatic fallback to `3k_exports` masters, and serves full 3K resolution in the Hero cover and Lightbox.
+- **Hierarchical Month → Day Timeline:** Automatically groups sticky navigation pills by month and expands active-month day sub-ticks on the right-edge timeline scrubber across multi-month archives.
+- **Proximity-Scaled Hero Carousel & Zoom Lightbox:** Full-bleed opening cover (`5★` orientation-matched slides anchored to XMP AI mask `ReferencePoint` coordinates) with 2× cursor-proximity magnification, touch scrubbing, cursor-panning zoom (`Z`), keyboard navigation (`←`, `→`, `F`, `Esc`), and direct downloads.
 
 ---
 
 ## Sync Google Drive `3k_exports` → Google Cloud Storage
 
-`scripts/sync_drive_to_gcs.py` wipes any previously uploaded images in your GCS bucket, streams all photographs directly from the Google Drive `3k_exports` folder (`1v-MDctwhXwaa49xQb6az4_V6hhto8FSQ`), applies `scripts/gcs-cors.json`, and uploads a fresh `manifest.json`.
+`scripts/sync_drive_to_gcs.py` incrementally syncs photographs to `gs://<BUCKET>/3k_exports/`, generates `800px` WebP grid thumbnails in `gs://<BUCKET>/thumbs/`, prunes stale objects, applies `scripts/gcs-cors.json`, and publishes `manifest.json` with compact `24px` WebP blur-up placeholders.
 
 1. **Authorize Drive read + GCS access once:**
    ```bash
@@ -36,24 +36,24 @@ Static single-page photography gallery published via GitHub Pages (`https://www.
    git commit -m "Configure GCS bucket URL in manifest.json"
    git push
    ```
-   After `remoteManifestUrl` is committed once, future syncs via `scripts/sync_drive_to_gcs.py --bucket "$BUCKET"` update the live gallery immediately without needing a new git commit.
+   After `remoteManifestUrl` is committed once, future syncs update the live gallery immediately without needing a new git commit.
 
-4. **Sync Lightroom star ratings & XMP mask focal points (metadata-only, no image re-upload):**
+4. **Sync Lightroom star ratings, XMP focal points & backfill `800px` WebP thumbnails (no 3K JPEG re-upload):**
    ```bash
    python3 scripts/sync_drive_to_gcs.py \
      --bucket "$BUCKET" \
      --manifest-only \
+     --backfill-thumbs \
      --exif-from-dir /path/to/raws_or_finished_library \
-     --lrcat /path/to/Lightroom\ Catalog.lrcat
+     --lrcat "/path/to/Lightroom Catalog.lrcat"
    ```
-   - **Hero Carousel:** Selects only top-rated photos (`maxRating`, e.g. `5★`) matching the viewer's screen orientation (landscape on desktop, portrait on phones) and anchors `object-position` to XMP AI mask `ReferencePoint` coordinates (or optical-focus saliency when no mask is present).
-   - **Highlights Tab:** Filters to `4★+` photos.
+   *(Pass `--local-dir /path/to/3k_exports` alongside `--manifest-only --backfill-thumbs` if you want thumbnails generated from local JPEGs rather than fetched from GCS.)*
 
 ---
 
 ## Sync Directly from a Local Folder → GCS
 
-If your exported JPEGs are already on your computer, pass `--local-dir` to upload straight from disk to GCS (skipping Google Drive and skipping unchanged files already in GCS via MD5 check):
+If your exported JPEGs are stored locally, pass `--local-dir` to upload new/changed 3K JPEGs and `800px` WebP thumbnails straight from disk to GCS (skipping unchanged files via MD5 check):
 
 ```bash
 python3 scripts/sync_drive_to_gcs.py \
@@ -62,5 +62,6 @@ python3 scripts/sync_drive_to_gcs.py \
   --exif-from-dir /path/to/raws_or_finished_library \
   --lrcat "/path/to/Lightroom Catalog.lrcat"
 ```
-*(Offline manifest generation without uploading to GCS is also available via `python3 scripts/build_manifest.py --images-dir /path/to/3k_exports --out manifest.json`.)*
+*(Offline manifest + thumbnail generation without uploading to GCS is also available via `python3 scripts/build_manifest.py --images-dir /path/to/3k_exports --thumbs-dir ./thumbs --out manifest.json`.)*
+
 
