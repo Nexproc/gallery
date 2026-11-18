@@ -320,6 +320,13 @@ def upload_gcs_object(
     )
 
 
+def fetch_gcs_manifest(bucket: str, token: str) -> dict[str, Any]:
+    encoded_b = urllib.parse.quote(bucket, safe="")
+    url = f"https://storage.googleapis.com/storage/v1/b/{encoded_b}/o/manifest.json?alt=media"
+    raw = api_bytes(url, token)
+    return json.loads(raw.decode("utf-8"))
+
+
 def apply_bucket_cors(bucket: str, cors_path: Path, token: str) -> None:
     if not cors_path.exists():
         return
@@ -441,9 +448,16 @@ def main() -> None:
     remote_manifest_url = f"https://storage.googleapis.com/{bucket}/manifest.json"
 
     if args.manifest_only:
-        if not args.manifest_out.exists():
-            raise RuntimeError(f"Existing manifest not found: {args.manifest_out}")
-        existing_manifest = json.loads(args.manifest_out.read_text(encoding="utf-8"))
+        if args.manifest_out.exists():
+            existing_manifest = json.loads(args.manifest_out.read_text(encoding="utf-8"))
+        else:
+            print(f"      Local {args.manifest_out.name} not found; fetching {remote_manifest_url} ...")
+            try:
+                existing_manifest = fetch_gcs_manifest(bucket, token)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Existing manifest not found locally ({args.manifest_out}) or in gs://{bucket}/manifest.json"
+                ) from exc
         existing_coll = existing_manifest.get("collection") or {}
         records_existing = existing_manifest.get("photos") or []
 

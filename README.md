@@ -31,13 +31,8 @@ Static single-page photography gallery published via GitHub Pages (`https://www.
    python3 scripts/sync_drive_to_gcs.py --bucket "$BUCKET"
    ```
 
-3. **Commit `manifest.json` once** (so the repository points to `https://storage.googleapis.com/$BUCKET/manifest.json`):
-   ```bash
-   git add manifest.json
-   git commit -m "Configure GCS bucket URL in manifest.json"
-   git push
-   ```
-   After `remoteManifestUrl` is committed once, future syncs update the live gallery immediately without needing a new git commit.
+3. **Configure bucket URL once (if changing buckets):**
+   `REMOTE_MANIFEST_URL` in `app.js` points directly to `https://storage.googleapis.com/$BUCKET/manifest.json`, and local `manifest.json` is gitignored as a local cache—so syncing updates the live gallery immediately without dirtying git or needing a commit.
 
 4. **Sync Lightroom star ratings, XMP focal points & backfill `800px` WebP thumbnails (no 3K JPEG re-upload):**
    ```bash

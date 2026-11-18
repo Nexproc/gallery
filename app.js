@@ -17,6 +17,9 @@
     density: "lightsync_gallery_density",
   };
 
+  const REMOTE_MANIFEST_URL =
+    "https://storage.googleapis.com/lightsync-gallery-media-8f4a2c/manifest.json";
+
   const MAX_CAROUSEL_SLIDES = 7;
   const HERO_PROXIMITY_RADIUS_PX = 165;
   const MAX_CONCURRENT_HYDRATIONS = 8;
@@ -2943,48 +2946,30 @@
     }
   }
 
-  function mergeManifestEnrichments(remoteManifest, baseManifest) {
-    if (!remoteManifest || !Array.isArray(remoteManifest.photos)) return baseManifest;
-    if (!baseManifest || !Array.isArray(baseManifest.photos)) return remoteManifest;
-
-    const baseById = new Map();
-    for (const bp of baseManifest.photos) {
-      if (bp && bp.id) baseById.set(bp.id, bp);
-    }
-
-    for (const rp of remoteManifest.photos) {
-      const bp = rp && baseById.get(rp.id);
-      if (!bp) continue;
-      if (!Array.isArray(rp.focalPoint) && Array.isArray(bp.focalPoint)) {
-        rp.focalPoint = bp.focalPoint;
-      }
-      if (typeof rp.rating !== "number" && typeof bp.rating === "number") {
-        rp.rating = bp.rating;
-      }
-    }
-    return remoteManifest;
-  }
-
   async function loadManifest() {
     if (window.__EMBEDDED_MANIFEST__) {
       return window.__EMBEDDED_MANIFEST__;
     }
-    const localRes = await fetch("./manifest.json");
-    if (!localRes.ok) {
-      throw new Error(`Failed to fetch manifest (${localRes.status})`);
-    }
-    const baseManifest = await localRes.json();
-    const remoteUrl = baseManifest.collection && baseManifest.collection.remoteManifestUrl;
-    if (remoteUrl) {
+    const params = new URLSearchParams(window.location.search);
+    const preferLocal = params.get("manifest") === "local";
+    const remoteUrl =
+      (window.__GALLERY_CONFIG__ && window.__GALLERY_CONFIG__.remoteManifestUrl) ||
+      REMOTE_MANIFEST_URL;
+
+    if (!preferLocal && remoteUrl) {
       try {
         const remoteRes = await fetch(remoteUrl, { cache: "no-cache" });
         if (remoteRes.ok) {
-          const remoteManifest = await remoteRes.json();
-          return mergeManifestEnrichments(remoteManifest, baseManifest);
+          return await remoteRes.json();
         }
       } catch (_) {}
     }
-    return baseManifest;
+
+    const localRes = await fetch("./manifest.json", { cache: "no-cache" });
+    if (!localRes.ok) {
+      throw new Error(`Failed to fetch manifest (${localRes.status})`);
+    }
+    return await localRes.json();
   }
 
   async function init() {

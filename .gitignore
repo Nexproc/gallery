@@ -1,8 +1,10 @@
-# Local image staging directories (serve production media from object storage)
+# Local image staging directories & generated manifest (served live from GCS)
 public/
 exports/
 3k_exports/
 1600px_exports/
+thumbs/
+/manifest.json
 
 # Python & OS artifacts
 __pycache__/
