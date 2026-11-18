@@ -1,6 +1,6 @@
 # lightsync-gallery
 
-Static single-page photography gallery published via GitHub Pages (`https://www.nicktitcombe.com/lightsync-gallery/`) and backed by Google Cloud Storage (`3k_exports` + `thumbs`).
+Static single-page photography gallery published via GitHub Pages (`https://www.nicktitcombe.com/gallery/`) and backed by Google Cloud Storage (`3k_exports` + `thumbs`).
 
 ## Features
 
