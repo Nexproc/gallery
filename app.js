@@ -524,19 +524,44 @@
     }
   }
 
+  function getPhotoAssetVersion(photo) {
+    if (!photo) return "";
+    if (photo._cacheVer) return photo._cacheVer;
+    const raw = `${photo.ver || ""}|${photo.width || 0}x${photo.height || 0}|${photo.lqip || ""}`;
+    let h = 0x811c9dc5;
+    for (let i = 0; i < raw.length; i++) {
+      h ^= raw.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    const ver = (h >>> 0).toString(16).padStart(8, "0");
+    photo._cacheVer = ver;
+    return ver;
+  }
+
+  function appendVersionParam(url, photo) {
+    if (!url || url.startsWith("data:") || url.startsWith("blob:")) return url;
+    const ver = getPhotoAssetVersion(photo);
+    if (!ver) return url;
+    return `${url}${url.includes("?") ? "&" : "?"}v=${ver}`;
+  }
+
   function resolvePhotoUrl(photo) {
     if (photo.embeddedSrc) return photo.embeddedSrc;
-    if (photo.url && /^https?:\/\//i.test(photo.url)) return photo.url;
+    if (photo.url && /^https?:\/\//i.test(photo.url)) {
+      return appendVersionParam(photo.url, photo);
+    }
     const base = (state.assetBaseUrl || "./3k_exports").replace(/\/+$/, "");
-    return `${base}/${photo.filename}`;
+    return appendVersionParam(`${base}/${photo.filename}`, photo);
   }
 
   function resolveThumbUrl(photo) {
     if (photo.embeddedSrc) return photo.embeddedSrc;
-    if (photo.thumbUrl && /^https?:\/\//i.test(photo.thumbUrl)) return photo.thumbUrl;
+    if (photo.thumbUrl && /^https?:\/\//i.test(photo.thumbUrl)) {
+      return appendVersionParam(photo.thumbUrl, photo);
+    }
     if (state.thumbBaseUrl && photo.thumb) {
       const tBase = state.thumbBaseUrl.replace(/\/+$/, "");
-      return `${tBase}/${photo.thumb}`;
+      return appendVersionParam(`${tBase}/${photo.thumb}`, photo);
     }
     return resolvePhotoUrl(photo);
   }

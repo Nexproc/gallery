@@ -7,6 +7,7 @@ import argparse
 import base64
 import datetime as dt
 import glob
+import hashlib
 import io
 import json
 import math
@@ -653,6 +654,7 @@ def _inspect_image_core(
         "dominantColor": dom_color,
         "focalPoint": focal_point,
         "lqip": lqip,
+        "ver": hashlib.md5(data).hexdigest()[:8],
         "_rating": rating,
     }
     if build_thumb:
