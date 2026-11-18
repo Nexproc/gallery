@@ -4,7 +4,7 @@ Static single-page photography gallery published via GitHub Pages (`https://www.
 
 ## Features
 
-- **Highlights-First Curation & Views:** Lands on a curated `Highlights` (`4★+`) editorial reel with instant switching to `Shoots` (automatic `> 12h` capture-session cover cards with drill-down), `Archive` (every photograph), and browser-saved `Favorites`.
+- **Highlights-First Curation & Views:** Lands on a curated `Highlights` (`4★+`) editorial reel with instant switching to `Shoots` (automatic `> 24h` capture-session cover cards with drill-down), `Archive` (every photograph), and browser-saved `Favorites`.
 - **Editorial Spreads ↔ Contact Sheet Density Toggle:** Switch between full-bleed asymmetric Hero spreads / justified rows and a compact zero-crop Contact Sheet (~6–9 photos per row) while preserving scroll position on the exact photograph in view.
 - **Virtualized Reel & 2-Tier Thumbnails for 2k–10k+ Archives:** Pre-computes exact pixel coordinates up front, mounts only rows near the viewport, evicts offscreen decoded bitmaps via LRU, hydrates `800px` WebP grid thumbnails (`thumbs/*.webp`) with automatic fallback to `3k_exports` masters, and serves full 3K resolution in the Hero cover and Lightbox.
 - **Hierarchical Month → Day Timeline:** Automatically groups sticky navigation pills by month and expands active-month day sub-ticks on the right-edge timeline scrubber across multi-month archives.

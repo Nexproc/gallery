@@ -1,6 +1,6 @@
 /**
  * Lightsync Gallery — High-Scale Single-Page Photograph Viewer
- * - Default Highlights (4★+) landing with Shoots (>12h sessions), Archive, and Favorites views
+ * - Default Highlights (4★+) landing with Shoots (>24h sessions), Archive, and Favorites views
  * - Editorial spreads + Contact Sheet density toggle with photo-anchored scroll preservation
  * - Exact-height virtualized reel & offscreen bitmap LRU eviction for 2k–10k+ photo archives
  * - Hierarchical Month + Active-Month Day timeline scrubber & sticky navigation
@@ -20,7 +20,7 @@
   const MAX_CAROUSEL_SLIDES = 7;
   const HERO_PROXIMITY_RADIUS_PX = 165;
   const MAX_CONCURRENT_HYDRATIONS = 8;
-  const SESSION_GAP_MS = 12 * 60 * 60 * 1000;
+  const SESSION_GAP_MS = 24 * 60 * 60 * 1000;
   const VIRTUAL_OVERSCAN_PX = 1250;
   const DIVIDER_BLOCK_HEIGHT = 44;
   const MAX_DECODED_CARDS = 220;
@@ -346,7 +346,7 @@
   }
 
   // =========================================================================
-  // Session / Shoot Derivation (>12h Gaps)
+  // Session / Shoot Derivation (>24h Gaps)
   // =========================================================================
 
   function parsePhotoTimestampMs(photo) {
