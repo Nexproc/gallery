@@ -71,6 +71,18 @@
         <rect x="10.1" y="7.7" width="2.7" height="4.8" rx="0.5" />
       </svg>
     `,
+    share: `
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4.8 4.3L7 2.1l2.2 2.2" />
+        <path d="M7 2.3v6.6" />
+        <path d="M2.5 8v3a.9.9 0 0 0 .9.9h7.2a.9.9 0 0 0 .9-.9V8" />
+      </svg>
+    `,
+    check: `
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2.5 7.4l3 3 6-6.5" />
+      </svg>
+    `,
   };
 
   const state = {
@@ -86,6 +98,10 @@
 
     filter: "highlights", // 'highlights' | 'shoots' | 'archive' | 'favorites'
     hasExplicitUrlView: false,
+    urlPhotoId: "",
+    urlDate: "",
+    urlAnchorId: "",
+    sharedPicks: new Set(),
     activeShootId: null,
     shootsIndexScrollY: 0,
     density: "editorial", // 'editorial' | 'compact'
@@ -130,6 +146,7 @@
     filterShoots: document.getElementById("filter-shoots"),
     filterArchive: document.getElementById("filter-archive"),
     filterFavorites: document.getElementById("filter-favorites"),
+    btnShareView: document.getElementById("btn-share-view"),
     btnDensityToggle: document.getElementById("btn-density-toggle"),
     btnThemeToggle: document.getElementById("btn-theme-toggle"),
 
@@ -146,6 +163,7 @@
     lbTitle: document.getElementById("lb-title"),
     lbBtnZoom: document.getElementById("lb-btn-zoom"),
     lbBtnFav: document.getElementById("lb-btn-fav"),
+    lbBtnShare: document.getElementById("lb-btn-share"),
     lbBtnDownload: document.getElementById("lb-btn-download"),
     lbBtnClose: document.getElementById("lb-btn-close"),
     lbStage: document.getElementById("lightbox-stage"),
@@ -154,9 +172,10 @@
     lbPrev: document.getElementById("lb-prev"),
     lbNext: document.getElementById("lb-next"),
     lbFilmstrip: document.getElementById("lightbox-filmstrip"),
+    shareToast: document.getElementById("share-toast"),
   };
 
-  const cardCache = new Map(); // photoId -> { figure, hiImg, btnFav }
+  const cardCache = new Map(); // photoId -> { figure, hiImg, btnFav, btnShare }
   const decodedCardLru = new Set(); // photoId in insertion order for offscreen bitmap eviction
   const mountedReelBlocks = new Map(); // blockKey -> HTMLElement
   const pendingHydrationSet = new Set();
@@ -167,6 +186,10 @@
   let scrollRaf = 0;
   let pumpRaf = 0;
   let postJumpTimer = null;
+  let urlScrollSyncTimer = null;
+  let shareToastTimer = null;
+  let lightboxPushedHistory = false;
+  let closingLightboxViaBack = false;
   let activeHydrations = 0;
   let lastContainerWidth = 0;
   let lastDateNavKey = "";
@@ -177,7 +200,7 @@
   let lastHeroOrientation = "";
 
   // =========================================================================
-  // Preferences, URL State & Asset Resolution
+  // Preferences, Live URL State, Sharing & Asset Resolution
   // =========================================================================
 
   function parseUrlViewState() {
@@ -185,6 +208,20 @@
       const params = new URLSearchParams(window.location.search);
       const rawView = (params.get("view") || "").toLowerCase();
       const shootParam = params.get("shoot") || "";
+      const photoParam = params.get("photo") || "";
+      const dateParam = params.get("date") || "";
+      const atParam = params.get("at") || "";
+      const picksParam = params.get("picks") || "";
+
+      state.urlPhotoId = photoParam;
+      state.urlDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam) ? dateParam : "";
+      state.urlAnchorId = atParam;
+      state.sharedPicks = new Set(
+        picksParam
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
 
       if (shootParam) {
         state.filter = "shoots";
@@ -204,7 +241,7 @@
       } else {
         state.filter = "highlights";
         state.activeShootId = null;
-        state.hasExplicitUrlView = false;
+        state.hasExplicitUrlView = Boolean(state.urlDate || state.urlAnchorId);
       }
     } catch (_) {}
   }
@@ -235,27 +272,239 @@
     } catch (_) {}
   }
 
-  function syncUrlParams(pushHistory = false) {
+  function isScrolledIntoGallery() {
+    if (!dom.heroStage) return window.scrollY > 40;
+    const navH = dom.galleryNav ? dom.galleryNav.getBoundingClientRect().height : 58;
+    return dom.heroStage.getBoundingClientRect().bottom <= navH + 16;
+  }
+
+  function getDeepScrollAnchorPhotoId() {
+    if (!reelWrapEl || !state.layoutBlocks.length || !isScrolledIntoGallery()) return null;
+    const navH = dom.galleryNav ? dom.galleryNav.getBoundingClientRect().height : 58;
+    const relY = navH + 24 - reelWrapEl.getBoundingClientRect().top;
+    const firstBlockH = state.layoutBlocks[0] ? state.layoutBlocks[0].height : 240;
+    if (relY < Math.min(firstBlockH * 0.7, 220)) return null;
+    return captureViewportAnchorPhotoId();
+  }
+
+  function buildUrlForState({ photoId = null, includeScrollPosition = true } = {}) {
     try {
       const url = new URL(window.location.href);
-      if (state.filter === "highlights") {
-        url.searchParams.delete("view");
-      } else {
+      for (const k of ["view", "shoot", "date", "at", "photo", "picks"]) {
+        url.searchParams.delete(k);
+      }
+
+      if (state.filter !== "highlights") {
         url.searchParams.set("view", state.filter);
       }
 
       if (state.filter === "shoots" && state.activeShootId) {
         url.searchParams.set("shoot", state.activeShootId);
-      } else {
-        url.searchParams.delete("shoot");
       }
 
+      if (state.filter === "favorites") {
+        const activeFavIds = state.favorites.size
+          ? [...state.favorites]
+          : [...state.sharedPicks];
+        if (activeFavIds.length > 0 && activeFavIds.length <= 80) {
+          url.searchParams.set("picks", activeFavIds.join(","));
+        }
+      }
+
+      if (photoId) {
+        url.searchParams.set("photo", photoId);
+        return url.toString();
+      }
+
+      if (includeScrollPosition && isScrolledIntoGallery()) {
+        if (isShootsIndexMode()) {
+          if (
+            state.activeDate &&
+            state.chapters.length > 1 &&
+            state.activeDate !== state.chapters[0].date
+          ) {
+            url.searchParams.set("date", state.activeDate);
+          }
+        } else if (getActiveShoot()) {
+          const anchorId = getDeepScrollAnchorPhotoId();
+          if (anchorId) {
+            url.searchParams.set("at", anchorId);
+          }
+        } else {
+          const anchorId = getDeepScrollAnchorPhotoId();
+          const anchorPhoto = anchorId ? state.photoById.get(anchorId) : null;
+          const visibleDate = (anchorPhoto && anchorPhoto.date) || state.activeDate;
+
+          if (visibleDate && state.chapters.length > 1) {
+            url.searchParams.set("date", visibleDate);
+          }
+
+          if (anchorId) {
+            const reelPhotos = getReelPhotos();
+            const firstOfDate = visibleDate
+              ? reelPhotos.find((p) => p.date === visibleDate)
+              : reelPhotos[0];
+            if (!firstOfDate || firstOfDate.id !== anchorId) {
+              url.searchParams.set("at", anchorId);
+            }
+          }
+        }
+      }
+
+      return url.toString();
+    } catch (_) {
+      return window.location.href;
+    }
+  }
+
+  function syncUrlParams(pushHistory = false, { includeScrollPosition = true } = {}) {
+    try {
+      clearTimeout(urlScrollSyncTimer);
+      const lbPhoto =
+        state.lightboxOpen && state.lightboxList[state.lightboxIdx]
+          ? state.lightboxList[state.lightboxIdx].id
+          : null;
+      const nextUrl = buildUrlForState({
+        photoId: lbPhoto,
+        includeScrollPosition,
+      });
+
+      if (nextUrl === window.location.href) return;
+
       if (pushHistory) {
-        window.history.pushState({}, "", url.toString());
+        window.history.pushState({}, "", nextUrl);
       } else {
-        window.history.replaceState({}, "", url.toString());
+        window.history.replaceState({}, "", nextUrl);
       }
     } catch (_) {}
+  }
+
+  function scheduleScrollUrlSync(delayMs = 240) {
+    if (state.lightboxOpen || performance.now() < suppressScrollObserversUntil) return;
+    clearTimeout(urlScrollSyncTimer);
+    urlScrollSyncTimer = setTimeout(() => {
+      if (!state.lightboxOpen && performance.now() >= suppressScrollObserversUntil) {
+        syncUrlParams(false, { includeScrollPosition: true });
+      }
+    }, delayMs);
+  }
+
+  function showShareToast(message) {
+    if (!dom.shareToast) return;
+    clearTimeout(shareToastTimer);
+    dom.shareToast.textContent = message;
+    dom.shareToast.hidden = false;
+    requestAnimationFrame(() => {
+      dom.shareToast.classList.add("is-visible");
+    });
+    shareToastTimer = setTimeout(() => {
+      dom.shareToast.classList.remove("is-visible");
+      setTimeout(() => {
+        if (!dom.shareToast.classList.contains("is-visible")) {
+          dom.shareToast.hidden = true;
+        }
+      }, 220);
+    }, 2200);
+  }
+
+  async function copyTextToClipboard(text) {
+    if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_) {}
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return Boolean(ok);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function flashButtonCopied(btn) {
+    if (!btn) return;
+    btn.classList.add("is-copied", "is-active");
+    setTimeout(() => {
+      btn.classList.remove("is-copied");
+      if (btn !== dom.btnDensityToggle || state.density !== "compact") {
+        btn.classList.remove("is-active");
+      }
+    }, 1400);
+  }
+
+  async function shareUrlWithFeedback({ url, title, toastMessage, triggerBtn = null }) {
+    const canMobileNativeShare =
+      typeof navigator !== "undefined" &&
+      typeof navigator.share === "function" &&
+      window.matchMedia &&
+      window.matchMedia("(pointer: coarse)").matches;
+
+    if (canMobileNativeShare) {
+      try {
+        await navigator.share({ title, url });
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+      }
+    }
+
+    const copied = await copyTextToClipboard(url);
+    flashButtonCopied(triggerBtn);
+    showShareToast(copied ? toastMessage : url);
+  }
+
+  function getBaseDocumentTitle() {
+    return (state.manifest && state.manifest.collection && state.manifest.collection.title) || document.title || "Gallery";
+  }
+
+  function shareCurrentLocation(triggerBtn = null) {
+    syncUrlParams(false, { includeScrollPosition: true });
+    const url = window.location.href;
+    const baseTitle = getBaseDocumentTitle();
+    const activeShoot = getActiveShoot();
+
+    let contextTitle = baseTitle;
+    let toastMessage = "Link copied to clipboard";
+
+    if (activeShoot) {
+      contextTitle = `${baseTitle} — ${activeShoot.title}`;
+      toastMessage = "Shoot link copied";
+    } else if (state.filter === "shoots") {
+      contextTitle = `${baseTitle} — Shoots`;
+      toastMessage = "Shoots link copied";
+    } else if (state.filter === "archive") {
+      contextTitle = `${baseTitle} — Archive`;
+      toastMessage = isScrolledIntoGallery() ? "Position link copied" : "Archive link copied";
+    } else if (state.filter === "favorites") {
+      contextTitle = `${baseTitle} — Favorites`;
+      toastMessage = "Favorites link copied";
+    } else if (isScrolledIntoGallery()) {
+      toastMessage = "Position link copied";
+    }
+
+    shareUrlWithFeedback({ url, title: contextTitle, toastMessage, triggerBtn });
+  }
+
+  function sharePhotoById(photoId, triggerBtn = null) {
+    const photo = state.photoById.get(photoId);
+    if (!photo) return;
+    const url = buildUrlForState({ photoId: photo.id, includeScrollPosition: false });
+    const title = `${getBaseDocumentTitle()} — ${photo.filename}`;
+    shareUrlWithFeedback({
+      url,
+      title,
+      toastMessage: "Photo link copied",
+      triggerBtn,
+    });
   }
 
   function syncDensityUI() {
@@ -307,7 +556,13 @@
       return state.photos.filter((p) => p.hero);
     }
     if (state.filter === "favorites") {
-      return state.photos.filter((p) => state.favorites.has(p.id));
+      if (state.favorites.size > 0) {
+        return state.photos.filter((p) => state.favorites.has(p.id));
+      }
+      if (state.sharedPicks.size > 0) {
+        return state.photos.filter((p) => state.sharedPicks.has(p.id));
+      }
+      return [];
     }
     if (state.filter === "shoots") {
       const shoot = getActiveShoot();
@@ -1012,6 +1267,7 @@
       suppressScrollObserversUntil = 0;
       syncVirtualReelDOM();
       schedulePumpHydration();
+      syncUrlParams(false, { includeScrollPosition: true });
     }, delayMs);
   }
 
@@ -1467,6 +1723,17 @@
         togglePhotoFavorite(photo.id);
       });
 
+      const btnShare = document.createElement("button");
+      btnShare.type = "button";
+      btnShare.className = "card-action-btn";
+      btnShare.title = "Share photograph";
+      btnShare.setAttribute("aria-label", "Share photograph");
+      btnShare.innerHTML = ICONS.share;
+      btnShare.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        sharePhotoById(photo.id, btnShare);
+      });
+
       const btnDl = document.createElement("a");
       btnDl.className = "card-action-btn";
       btnDl.href = resolvePhotoUrl(photo);
@@ -1475,13 +1742,13 @@
       btnDl.textContent = "↓";
       btnDl.addEventListener("click", (ev) => ev.stopPropagation());
 
-      topActions.append(btnFav, btnDl);
+      topActions.append(btnFav, btnShare, btnDl);
       overlay.appendChild(topActions);
       figure.appendChild(overlay);
 
       figure.addEventListener("click", () => openLightboxByPhotoId(photo.id));
 
-      entry = { figure, hiImg, btnFav };
+      entry = { figure, hiImg, btnFav, btnShare };
       cardCache.set(photo.id, entry);
     }
 
@@ -1821,7 +2088,7 @@
     state.filter = "shoots";
     state.activeShootId = shootId;
     state.activeDate = null;
-    syncUrlParams(pushHistory);
+    syncUrlParams(pushHistory, { includeScrollPosition: false });
     renderGallery(true);
 
     requestAnimationFrame(() => {
@@ -1838,7 +2105,7 @@
     const restoreY = state.shootsIndexScrollY;
     state.activeShootId = null;
     state.activeDate = null;
-    syncUrlParams(pushHistory);
+    syncUrlParams(pushHistory, { includeScrollPosition: false });
     renderGallery(true);
 
     if (restoreY > 0) {
@@ -1979,6 +2246,9 @@
         backBtn.textContent = "← All Shoots";
         backBtn.addEventListener("click", () => closeShootDetail(true));
 
+        const detailRight = document.createElement("div");
+        detailRight.className = "shoot-detail-right";
+
         const detailMeta = document.createElement("div");
         detailMeta.className = "shoot-detail-meta";
         const titleEl = document.createElement("span");
@@ -1989,7 +2259,15 @@
         countEl.textContent = activeShoot.countLabel;
         detailMeta.append(titleEl, countEl);
 
-        detailBar.append(backBtn, detailMeta);
+        const shareShootBtn = document.createElement("button");
+        shareShootBtn.type = "button";
+        shareShootBtn.className = "shoot-share-btn";
+        shareShootBtn.title = "Share this shoot";
+        shareShootBtn.innerHTML = `${ICONS.share}<span>Share</span>`;
+        shareShootBtn.addEventListener("click", () => shareCurrentLocation(shareShootBtn));
+
+        detailRight.append(detailMeta, shareShootBtn);
+        detailBar.append(backBtn, detailRight);
         dom.chaptersContainer.appendChild(detailBar);
       }
 
@@ -2027,6 +2305,7 @@
 
     if (state.filter === "favorites") {
       renderGallery();
+      syncUrlParams(false);
     } else {
       updateToolbarCounts();
       syncNavHeight();
@@ -2035,7 +2314,12 @@
     if (state.lightboxOpen) syncLightboxControls();
   }
 
-  function openLightboxByPhotoId(photoId, explicitList = null) {
+  function openLightboxByPhotoId(
+    photoId,
+    explicitList = null,
+    { pushHistory = true, syncUrl = true } = {}
+  ) {
+    const wasOpen = state.lightboxOpen;
     const baseList = explicitList || getReelPhotos();
     const list = baseList.length > 0 ? baseList : state.photos;
     let idx = list.findIndex((p) => p.id === photoId);
@@ -2056,14 +2340,37 @@
     dom.lightbox.classList.add("is-open");
     document.body.style.overflow = "hidden";
 
-    updateLightboxSlide();
+    updateLightboxSlide({ syncUrl: false });
+
+    if (syncUrl) {
+      if (!wasOpen && pushHistory) {
+        lightboxPushedHistory = true;
+        syncUrlParams(true, { includeScrollPosition: false });
+      } else {
+        syncUrlParams(false, { includeScrollPosition: false });
+      }
+    }
   }
 
-  function closeLightbox() {
+  function closeLightbox({ fromPopstate = false } = {}) {
+    if (!state.lightboxOpen) return;
     state.lightboxOpen = false;
     setLightboxZoom(false);
     dom.lightbox.classList.remove("is-open");
     document.body.style.overflow = "";
+
+    if (fromPopstate) {
+      lightboxPushedHistory = false;
+      return;
+    }
+
+    if (lightboxPushedHistory) {
+      lightboxPushedHistory = false;
+      closingLightboxViaBack = true;
+      window.history.back();
+    } else {
+      syncUrlParams(false, { includeScrollPosition: true });
+    }
   }
 
   function stepLightbox(delta) {
@@ -2166,7 +2473,7 @@
     }
   }
 
-  function updateLightboxSlide() {
+  function updateLightboxSlide({ syncUrl = true } = {}) {
     const photo = state.lightboxList[state.lightboxIdx];
     if (!photo) return;
 
@@ -2184,6 +2491,10 @@
     syncLightboxControls();
     preloadNeighborLightboxSlides();
     syncLightboxFilmstripWindow();
+
+    if (syncUrl && state.lightboxOpen) {
+      syncUrlParams(false, { includeScrollPosition: false });
+    }
   }
 
   function syncLightboxControls() {
@@ -2197,8 +2508,87 @@
   }
 
   // =========================================================================
-  // 7. Event Listeners
+  // 7. Deep-Link Scroll Restoration & Event Listeners
   // =========================================================================
+
+  function scrollToGalleryMainInstant() {
+    if (!dom.galleryMain) return;
+    const navH = syncNavHeight();
+    const mainTop = window.scrollY + dom.galleryMain.getBoundingClientRect().top - navH + 4;
+    if (mainTop > 0) {
+      suppressScrollObserversUntil = performance.now() + 260;
+      window.scrollTo({ top: Math.max(0, mainTop), behavior: "instant" });
+      syncScrubberVisibility();
+      syncVirtualReelDOM(true);
+      schedulePumpHydration();
+    }
+  }
+
+  function scrollToPhotoInstant(photoId) {
+    const photo = state.photoById.get(photoId);
+    if (!photo || !reelWrapEl || !state.photoTopById.has(photoId)) return false;
+    const navH = syncNavHeight();
+    const reelOriginTop = window.scrollY + reelWrapEl.getBoundingClientRect().top;
+    const offsetY = state.photoTopById.get(photoId);
+    suppressScrollObserversUntil = performance.now() + 320;
+    window.scrollTo({
+      top: Math.max(0, reelOriginTop + offsetY - navH - 14),
+      behavior: "instant",
+    });
+    if (photo.date && !getActiveShoot()) {
+      state.activeDate = photo.date;
+      highlightActiveDateUI(photo.date, true);
+    }
+    syncScrubberVisibility();
+    syncVirtualReelDOM(true);
+    schedulePumpHydration();
+    return true;
+  }
+
+  function scrollToDateInstant(dateKey) {
+    if (!dateKey) return false;
+    if (isShootsIndexMode()) {
+      const cards = Array.from(dom.chaptersContainer.querySelectorAll(".shoot-card"));
+      const targetCard =
+        cards.find((el) => {
+          const shoot = state.shootById.get(el.dataset.shootId);
+          return shoot && shoot.datesSet.has(dateKey);
+        }) ||
+        cards.find((el) => {
+          const shoot = state.shootById.get(el.dataset.shootId);
+          return shoot && shoot.newestDate <= dateKey;
+        });
+      if (!targetCard) return false;
+      const navH = syncNavHeight();
+      const targetTop = window.scrollY + targetCard.getBoundingClientRect().top - navH - 14;
+      suppressScrollObserversUntil = performance.now() + 320;
+      state.activeDate = dateKey;
+      highlightActiveDateUI(dateKey, true);
+      window.scrollTo({ top: Math.max(0, targetTop), behavior: "instant" });
+      syncScrubberVisibility();
+      schedulePumpHydration();
+      return true;
+    }
+
+    const reelPhotos = getReelPhotos();
+    const targetPhoto = reelPhotos.find((p) => p.date === dateKey);
+    if (targetPhoto && scrollToPhotoInstant(targetPhoto.id)) {
+      return true;
+    }
+    return false;
+  }
+
+  function scrollToUrlPositionInstant() {
+    if (state.urlAnchorId && scrollToPhotoInstant(state.urlAnchorId)) {
+      return;
+    }
+    if (state.urlDate && scrollToDateInstant(state.urlDate)) {
+      return;
+    }
+    if (state.hasExplicitUrlView) {
+      scrollToGalleryMainInstant();
+    }
+  }
 
   function bindHorizontalSwipe(el, onSwipeLeft, onSwipeRight) {
     let startX = 0;
@@ -2281,20 +2671,55 @@
             }
             return;
           }
+          const wasInGallery = isScrolledIntoGallery();
           state.filter = nextFilter;
           state.activeShootId = null;
           state.activeDate = null;
-          syncUrlParams(true);
+          syncUrlParams(true, { includeScrollPosition: false });
           renderGallery(true);
+          if (wasInGallery) {
+            scrollToGalleryMainInstant();
+          }
         });
       }
     );
 
     window.addEventListener("popstate", () => {
+      const prevFilter = state.filter;
+      const prevShootId = state.activeShootId;
       parseUrlViewState();
-      state.activeDate = null;
-      renderGallery(true);
+
+      if (prevFilter !== state.filter || prevShootId !== state.activeShootId) {
+        state.activeDate = null;
+        renderGallery(true);
+      }
+
+      if (state.urlPhotoId && state.photoById.has(state.urlPhotoId)) {
+        openLightboxByPhotoId(state.urlPhotoId, null, {
+          pushHistory: false,
+          syncUrl: false,
+        });
+        return;
+      }
+
+      if (closingLightboxViaBack) {
+        closingLightboxViaBack = false;
+        return;
+      }
+
+      if (state.lightboxOpen) {
+        closeLightbox({ fromPopstate: true });
+        return;
+      }
+
+      if (state.urlAnchorId || state.urlDate) {
+        scrollToUrlPositionInstant();
+      }
     });
+
+    if (dom.btnShareView) {
+      dom.btnShareView.addEventListener("click", () => shareCurrentLocation(dom.btnShareView));
+    }
 
     if (dom.btnDensityToggle) {
       dom.btnDensityToggle.addEventListener("click", toggleDensityMode);
@@ -2374,7 +2799,7 @@
       }
     );
 
-    dom.lbBtnClose.addEventListener("click", closeLightbox);
+    dom.lbBtnClose.addEventListener("click", () => closeLightbox());
     dom.lbPrev.addEventListener("click", () => stepLightbox(-1));
     dom.lbNext.addEventListener("click", () => stepLightbox(1));
 
@@ -2419,6 +2844,13 @@
       if (photo) togglePhotoFavorite(photo.id);
     });
 
+    if (dom.lbBtnShare) {
+      dom.lbBtnShare.addEventListener("click", () => {
+        const photo = state.lightboxList[state.lightboxIdx];
+        if (photo) sharePhotoById(photo.id, dom.lbBtnShare);
+      });
+    }
+
     dom.lbStage.addEventListener("click", (ev) => {
       if (ev.target === dom.lbStage) closeLightbox();
     });
@@ -2432,6 +2864,9 @@
       else if (ev.key === "f" || ev.key === "F") {
         const p = state.lightboxList[state.lightboxIdx];
         if (p) togglePhotoFavorite(p.id);
+      } else if (ev.key === "s" || ev.key === "S") {
+        const p = state.lightboxList[state.lightboxIdx];
+        if (p) sharePhotoById(p.id, dom.lbBtnShare);
       }
     });
 
@@ -2445,6 +2880,7 @@
           syncVirtualReelDOM();
           updateActiveChapterFromScroll();
           schedulePumpHydration();
+          scheduleScrollUrlSync();
         });
       },
       { passive: true }
@@ -2591,7 +3027,18 @@
 
       buildShootsFromPhotos(state.photos);
 
+      // If deep-linking directly to a non-highlight photo or anchor without an explicit ?view=,
+      // switch the background reel to Archive so the target photo is visible in the grid.
+      const deepTargetId = state.urlPhotoId || state.urlAnchorId;
+      const deepTargetPhoto = deepTargetId ? state.photoById.get(deepTargetId) : null;
       if (
+        state.filter === "highlights" &&
+        deepTargetPhoto &&
+        !deepTargetPhoto.hero &&
+        !new URLSearchParams(window.location.search).get("view")
+      ) {
+        state.filter = "archive";
+      } else if (
         state.filter === "highlights" &&
         !state.hasExplicitUrlView &&
         !state.photos.some((p) => p.hero)
@@ -2602,6 +3049,18 @@
       applyCollectionHeader(manifest.collection);
       renderHeroCover();
       renderGallery(true);
+
+      requestAnimationFrame(() => {
+        if (state.urlPhotoId && state.photoById.has(state.urlPhotoId)) {
+          scrollToPhotoInstant(state.urlPhotoId);
+          openLightboxByPhotoId(state.urlPhotoId, null, {
+            pushHistory: false,
+            syncUrl: false,
+          });
+        } else {
+          scrollToUrlPositionInstant();
+        }
+      });
     } catch (_) {
       dom.chaptersContainer.innerHTML = `
         <div class="empty-state">

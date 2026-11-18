@@ -733,10 +733,40 @@ button {
   border-color: var(--border-strong);
 }
 
+.shoot-detail-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
 .shoot-detail-meta {
   display: flex;
   align-items: baseline;
   gap: 10px;
+}
+
+.shoot-share-btn {
+  appearance: none;
+  border: 1px solid var(--border-hairline);
+  background: var(--surface-elevated);
+  padding: 6px 11px;
+  font-size: 0.71rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 150ms ease, background-color 150ms ease, border-color 150ms ease;
+}
+
+.shoot-share-btn:hover {
+  color: var(--ink-primary);
+  background: var(--surface-subtle);
+  border-color: var(--border-strong);
 }
 
 .shoot-detail-title {
@@ -867,6 +897,10 @@ button {
 
 .card-action-btn.is-fav {
   color: hsl(8, 84%, 66%);
+}
+
+.card-action-btn.is-copied {
+  color: hsl(142, 62%, 72%);
 }
 
 .pagination-sentinel {
@@ -1227,6 +1261,34 @@ button {
 
 .back-top-btn:hover {
   color: var(--ink-primary);
+}
+
+.share-toast {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translate(-50%, 8px);
+  z-index: 260;
+  padding: 9px 16px;
+  border-radius: 2px;
+  background: rgba(16, 14, 12, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: hsl(36, 22%, 94%);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.share-toast.is-visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 
 @media (max-aspect-ratio: 19/20) {

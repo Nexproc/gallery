@@ -8,7 +8,8 @@ Static single-page photography gallery published via GitHub Pages (`https://www.
 - **Editorial Spreads ↔ Contact Sheet Density Toggle:** Switch between full-bleed asymmetric Hero spreads / justified rows and a compact zero-crop Contact Sheet (~6–9 photos per row) while preserving scroll position on the exact photograph in view.
 - **Virtualized Reel & 2-Tier Thumbnails for 2k–10k+ Archives:** Pre-computes exact pixel coordinates up front, mounts only rows near the viewport, evicts offscreen decoded bitmaps via LRU, hydrates `800px` WebP grid thumbnails (`thumbs/*.webp`) with automatic fallback to `3k_exports` masters, and serves full 3K resolution in the Hero cover and Lightbox.
 - **Hierarchical Month → Day Timeline:** Automatically groups sticky navigation pills by month and expands active-month day sub-ticks on the right-edge timeline scrubber across multi-month archives.
-- **Proximity-Scaled Hero Carousel & Zoom Lightbox:** Full-bleed opening cover (`5★` orientation-matched slides anchored to XMP AI mask `ReferencePoint` coordinates) with 2× cursor-proximity magnification, touch scrubbing, cursor-panning zoom (`Z`), keyboard navigation (`←`, `→`, `F`, `Esc`), and direct downloads.
+- **Live Deep-Link URLs & Native/Clipboard Sharing:** Continuously reflects the active reel (`?view=`), shoot (`?shoot=`), scroll position (`?date=`, `?at=`), shared `Favorites` (`?picks=`), and active Lightbox photograph (`?photo=`) in the address bar, with one-click Share actions on the toolbar, shoot headers, photo cards, and Lightbox (`S`).
+- **Proximity-Scaled Hero Carousel & Zoom Lightbox:** Full-bleed opening cover (`5★` orientation-matched slides anchored to XMP AI mask `ReferencePoint` coordinates) with 2× cursor-proximity magnification, touch scrubbing, cursor-panning zoom (`Z`), keyboard navigation (`←`, `→`, `F`, `S`, `Esc`), and direct downloads.
 
 ---
 
