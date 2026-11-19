@@ -20,7 +20,7 @@
   const REMOTE_MANIFEST_URL =
     "https://storage.googleapis.com/lightsync-gallery-media-8f4a2c/manifest.json";
 
-  const MAX_CAROUSEL_SLIDES = 7;
+  const MAX_CAROUSEL_SLIDES = 10;
   const HERO_PROXIMITY_RADIUS_PX = 165;
   const MAX_CONCURRENT_HYDRATIONS = 8;
   const SESSION_GAP_MS = 24 * 60 * 60 * 1000;
@@ -856,7 +856,7 @@
   function isWellExposedForHero(photo) {
     const lum = estimateHexLuminance(photo.dominantColor);
     const lqipLen = (photo.lqip || "").length;
-    return lum >= 26 && lqipLen >= 100;
+    return lum >= 4 && lqipLen >= 90;
   }
 
   function getDesiredHeroOrientation() {
@@ -880,6 +880,19 @@
 
   function pickCarouselSlides(targetOrientation) {
     const wantOrientation = targetOrientation || getDesiredHeroOrientation();
+    const col = (state.manifest && state.manifest.collection) || {};
+    const curatedIds =
+      wantOrientation === "portrait" ? col.heroPortraitIds : col.heroLandscapeIds;
+    if (Array.isArray(curatedIds) && curatedIds.length > 0 && state.photoById) {
+      const curated = curatedIds
+        .map((id) => state.photoById.get(id))
+        .filter(Boolean)
+        .slice(0, MAX_CAROUSEL_SLIDES);
+      if (curated.length > 0) {
+        return curated;
+      }
+    }
+
     const rated = state.photos.filter(
       (p) => typeof p.rating === "number" && p.rating > 0
     );
