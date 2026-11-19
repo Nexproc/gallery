@@ -510,6 +510,83 @@
     });
   }
 
+  function guessMimeFromFilename(filename) {
+    const lower = String(filename || "").toLowerCase();
+    if (lower.endsWith(".webp")) return "image/webp";
+    if (lower.endsWith(".png")) return "image/png";
+    if (lower.endsWith(".avif")) return "image/avif";
+    return "image/jpeg";
+  }
+
+  async function downloadPhotoById(photoId, triggerBtn = null) {
+    const photo = state.photoById.get(photoId);
+    if (!photo) return;
+    if (triggerBtn && triggerBtn.dataset.downloading === "1") return;
+
+    const rawUrl = resolvePhotoUrl(photo);
+    const filename = photo.filename || `${photo.id}.jpg`;
+
+    if (rawUrl.startsWith("data:") || rawUrl.startsWith("blob:")) {
+      const a = document.createElement("a");
+      a.href = rawUrl;
+      a.download = filename;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 0);
+      return;
+    }
+
+    const labelEl = triggerBtn ? triggerBtn.querySelector(".lb-btn-label") : null;
+    const origLabel = labelEl ? labelEl.textContent : "";
+    let slowTimer = 0;
+
+    if (triggerBtn) {
+      triggerBtn.dataset.downloading = "1";
+      triggerBtn.classList.add("is-busy");
+      if (labelEl) labelEl.textContent = "Saving…";
+    }
+    slowTimer = setTimeout(() => {
+      showShareToast(`Downloading ${filename}…`);
+    }, 380);
+
+    try {
+      // Append dl=1 so Safari/WebKit never collides with a non-CORS <img> cache entry
+      const corsUrl = `${rawUrl}${rawUrl.includes("?") ? "&" : "?"}dl=1`;
+      const res = await fetch(corsUrl, { mode: "cors" });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const fetchedBlob = await res.blob();
+      const blob =
+        fetchedBlob.type && fetchedBlob.type !== "application/octet-stream"
+          ? fetchedBlob
+          : new Blob([fetchedBlob], { type: guessMimeFromFilename(filename) });
+
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 100);
+      // Keep blob URL alive for 60s so mobile confirmation sheets finish reading it
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      clearTimeout(slowTimer);
+    } catch (_) {
+      clearTimeout(slowTimer);
+      window.open(rawUrl, "_blank", "noopener,noreferrer");
+    } finally {
+      if (triggerBtn) {
+        delete triggerBtn.dataset.downloading;
+        triggerBtn.classList.remove("is-busy");
+        if (labelEl && origLabel) labelEl.textContent = origLabel;
+      }
+    }
+  }
+
   function syncDensityUI() {
     const isCompact = state.density === "compact";
     if (dom.galleryMain) {
@@ -1767,8 +1844,15 @@
       btnDl.href = resolvePhotoUrl(photo);
       btnDl.download = photo.filename;
       btnDl.title = "Download photograph";
+      btnDl.setAttribute("aria-label", "Download photograph");
       btnDl.textContent = "↓";
-      btnDl.addEventListener("click", (ev) => ev.stopPropagation());
+      btnDl.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (ev.button === 0 && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey && !ev.altKey) {
+          ev.preventDefault();
+          downloadPhotoById(photo.id, btnDl);
+        }
+      });
 
       topActions.append(btnFav, btnShare, btnDl);
       overlay.appendChild(topActions);
@@ -2879,6 +2963,15 @@
       });
     }
 
+    if (dom.lbBtnDownload) {
+      dom.lbBtnDownload.addEventListener("click", (ev) => {
+        if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+        ev.preventDefault();
+        const photo = state.lightboxList[state.lightboxIdx];
+        if (photo) downloadPhotoById(photo.id, dom.lbBtnDownload);
+      });
+    }
+
     dom.lbStage.addEventListener("click", (ev) => {
       if (ev.target === dom.lbStage) closeLightbox();
     });
@@ -2895,6 +2988,9 @@
       } else if (ev.key === "s" || ev.key === "S") {
         const p = state.lightboxList[state.lightboxIdx];
         if (p) sharePhotoById(p.id, dom.lbBtnShare);
+      } else if (ev.key === "d" || ev.key === "D") {
+        const p = state.lightboxList[state.lightboxIdx];
+        if (p) downloadPhotoById(p.id, dom.lbBtnDownload);
       }
     });
 

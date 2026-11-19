@@ -5,7 +5,9 @@
       "https://nicktitcombe.com",
       "https://nexproc.github.io",
       "http://localhost:4173",
-      "http://127.0.0.1:4173"
+      "http://127.0.0.1:4173",
+      "http://localhost:8000",
+      "http://127.0.0.1:8000"
     ],
     "method": ["GET", "HEAD"],
     "responseHeader": ["Content-Type", "Cache-Control", "Content-Length", "Content-Range"],

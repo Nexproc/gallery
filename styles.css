@@ -903,6 +903,11 @@ button {
   color: hsl(142, 62%, 72%);
 }
 
+.card-action-btn.is-busy {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .pagination-sentinel {
   display: flex;
   justify-content: center;
@@ -1118,6 +1123,11 @@ button {
 .lb-btn.is-active {
   border-color: hsl(38, 70%, 62%);
   color: hsl(38, 82%, 72%);
+}
+
+.lb-btn.is-busy {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 .lightbox-stage {
