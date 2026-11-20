@@ -224,8 +224,8 @@ def render_stub_html(
         '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
         f"  <title>{e_title}</title>\n"
         f'  <meta name="description" content="{e_desc}" />\n'
-        '  <link rel="icon" href="../../favicon.ico" sizes="any" />\n'
-        '  <link rel="icon" type="image/png" sizes="32x32" href="../../icon-32.png" />\n'
+        '  <link rel="icon" href="../../favicon.ico?v=3" sizes="any" />\n'
+        '  <link rel="icon" type="image/png" sizes="32x32" href="../../icon-32.png?v=3" />\n'
         f'  <link rel="apple-touch-icon" sizes="180x180" href="{e_apple}" />\n'
         '  <meta property="og:type" content="website" />\n'
         f'  <meta property="og:site_name" content="{e_site}" />\n'
@@ -316,7 +316,7 @@ def main() -> None:
     site_url = args.site_url.rstrip("/")
     site_name = str(coll.get("title") or "Gallery").strip() or "Gallery"
     asset_base_url = str(coll.get("assetBaseUrl") or f"{site_url}/3k_exports")
-    apple_icon_url = f"{site_url}/apple-touch-icon.png"
+    apple_icon_url = f"{site_url}/apple-touch-icon.png?v=3"
 
     total_photos = len(photos)
     date_range = str(coll.get("dateRange") or "").strip()
