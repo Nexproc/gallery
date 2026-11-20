@@ -20,6 +20,20 @@
   const REMOTE_MANIFEST_URL =
     "https://storage.googleapis.com/lightsync-gallery-media-8f4a2c/manifest.json";
 
+  const GALLERY_ROOT_PATH = (() => {
+    let p = (typeof window !== "undefined" && window.location && window.location.pathname) || "/";
+    p = p.replace(/\/index\.html$/i, "/");
+    p = p.replace(/\/(?:p|s)\/[^/]+\/?$/, "/");
+    if (!p.endsWith("/")) p += "/";
+    return p;
+  })();
+
+  const IS_STATIC_SHARE_HOST =
+    typeof window !== "undefined" &&
+    /^https?:$/i.test(window.location.protocol) &&
+    window.location.hostname !== "localhost" &&
+    window.location.hostname !== "127.0.0.1";
+
   const MAX_CAROUSEL_SLIDES = 10;
   const HERO_PROXIMITY_RADIUS_PX = 165;
   const MAX_CONCURRENT_HYDRATIONS = 8;
@@ -96,7 +110,7 @@
     shoots: [],
     shootById: new Map(),
     heroPhotos: [],
-    assetBaseUrl: "./3k_exports",
+    assetBaseUrl: `${GALLERY_ROOT_PATH}3k_exports`,
     thumbBaseUrl: "",
 
     filter: "highlights", // 'highlights' | 'shoots' | 'archive' | 'favorites'
@@ -208,10 +222,16 @@
 
   function parseUrlViewState() {
     try {
+      const pathname = window.location.pathname || "";
+      const pathPhotoMatch = /\/p\/([^/]+)\/?$/.exec(pathname);
+      const pathShootMatch = /\/s\/([^/]+)\/?$/.exec(pathname);
+
       const params = new URLSearchParams(window.location.search);
       const rawView = (params.get("view") || "").toLowerCase();
-      const shootParam = params.get("shoot") || "";
-      const photoParam = params.get("photo") || "";
+      const shootParam =
+        params.get("shoot") || (pathShootMatch ? decodeURIComponent(pathShootMatch[1]) : "");
+      const photoParam =
+        params.get("photo") || (pathPhotoMatch ? decodeURIComponent(pathPhotoMatch[1]) : "");
       const dateParam = params.get("date") || "";
       const atParam = params.get("at") || "";
       const picksParam = params.get("picks") || "";
@@ -290,19 +310,16 @@
     return captureViewportAnchorPhotoId();
   }
 
-  function buildUrlForState({ photoId = null, includeScrollPosition = true } = {}) {
+  function buildUrlForState({
+    photoId = null,
+    includeScrollPosition = true,
+    useSharePath = IS_STATIC_SHARE_HOST,
+  } = {}) {
     try {
       const url = new URL(window.location.href);
+      url.pathname = GALLERY_ROOT_PATH;
       for (const k of ["view", "shoot", "date", "at", "photo", "picks"]) {
         url.searchParams.delete(k);
-      }
-
-      if (state.filter !== "highlights") {
-        url.searchParams.set("view", state.filter);
-      }
-
-      if (state.filter === "shoots" && state.activeShootId) {
-        url.searchParams.set("shoot", state.activeShootId);
       }
 
       if (state.filter === "favorites") {
@@ -315,8 +332,29 @@
       }
 
       if (photoId) {
-        url.searchParams.set("photo", photoId);
+        if (state.filter !== "highlights") {
+          url.searchParams.set("view", state.filter);
+        }
+        if (state.filter === "shoots" && state.activeShootId) {
+          url.searchParams.set("shoot", state.activeShootId);
+        }
+        if (useSharePath) {
+          url.pathname = `${GALLERY_ROOT_PATH}p/${encodeURIComponent(photoId)}/`;
+        } else {
+          url.searchParams.set("photo", photoId);
+        }
         return url.toString();
+      }
+
+      if (state.filter === "shoots" && state.activeShootId && useSharePath) {
+        url.pathname = `${GALLERY_ROOT_PATH}s/${encodeURIComponent(state.activeShootId)}/`;
+      } else {
+        if (state.filter !== "highlights") {
+          url.searchParams.set("view", state.filter);
+        }
+        if (state.filter === "shoots" && state.activeShootId) {
+          url.searchParams.set("shoot", state.activeShootId);
+        }
       }
 
       if (includeScrollPosition && isScrolledIntoGallery()) {
@@ -627,7 +665,7 @@
     if (photo.url && /^https?:\/\//i.test(photo.url)) {
       return appendVersionParam(photo.url, photo);
     }
-    const base = (state.assetBaseUrl || "./3k_exports").replace(/\/+$/, "");
+    const base = (state.assetBaseUrl || `${GALLERY_ROOT_PATH}3k_exports`).replace(/\/+$/, "");
     return appendVersionParam(`${base}/${photo.filename}`, photo);
   }
 
@@ -3099,14 +3137,26 @@
       } catch (_) {}
     }
 
-    const localRes = await fetch("./manifest.json", { cache: "no-cache" });
+    const localRes = await fetch(`${GALLERY_ROOT_PATH}manifest.json`, { cache: "no-cache" });
     if (!localRes.ok) {
       throw new Error(`Failed to fetch manifest (${localRes.status})`);
     }
     return await localRes.json();
   }
 
+  function pinHeadAssetLinks() {
+    document
+      .querySelectorAll('link[rel*="icon"], link[rel="manifest"]')
+      .forEach((el) => {
+        const raw = el.getAttribute("href") || "";
+        if (raw.startsWith("./")) {
+          el.setAttribute("href", `${GALLERY_ROOT_PATH}${raw.slice(2)}`);
+        }
+      });
+  }
+
   async function init() {
+    pinHeadAssetLinks();
     loadPersistedState();
     setupObservers();
     bindEvents();
@@ -3140,7 +3190,8 @@
         String(b.date || "").localeCompare(String(a.date || ""))
       );
       state.assetBaseUrl =
-        (manifest.collection && manifest.collection.assetBaseUrl) || "./3k_exports";
+        (manifest.collection && manifest.collection.assetBaseUrl) ||
+        `${GALLERY_ROOT_PATH}3k_exports`;
       state.thumbBaseUrl =
         (manifest.collection && manifest.collection.thumbBaseUrl) || "";
 
@@ -3174,10 +3225,13 @@
           scrollToPhotoInstant(state.urlPhotoId);
           openLightboxByPhotoId(state.urlPhotoId, null, {
             pushHistory: false,
-            syncUrl: false,
+            syncUrl: true,
           });
         } else {
           scrollToUrlPositionInstant();
+          if (state.activeShootId) {
+            syncUrlParams(false, { includeScrollPosition: false });
+          }
         }
       });
     } catch (_) {
